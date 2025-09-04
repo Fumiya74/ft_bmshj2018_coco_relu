@@ -1,0 +1,38 @@
+import os, glob, random
+from pathlib import Path
+from PIL import Image
+from torch.utils.data import Dataset
+import torchvision.transforms as T
+
+IMG_EXTS = (".jpg",".jpeg",".png",".bmp",".webp")
+
+class ImageFolder224(Dataset):
+    def __init__(self, root, split="train", use_prepared=True, input_size=224):
+        self.root = Path(root)
+        self.split = split
+        self.use_prepared = use_prepared
+        self.input_size = input_size
+        if use_prepared:
+            self.paths = [p for p in (self.root/split).glob("*") if p.suffix.lower() in IMG_EXTS]
+            self.transform = T.ToTensor()
+        else:
+            # オンザフライで CenterCrop+Resize
+            if split == "train":
+                base = self.root/"train2017"
+            else:
+                base = self.root/"val2017"
+            self.paths = [p for p in base.rglob("*") if p.suffix.lower() in IMG_EXTS]
+            self.transform = T.Compose([
+                T.CenterCrop(min(480, 0x7FFFFFFF)),
+                T.Resize((input_size,input_size)),
+                T.ToTensor(),
+            ])
+
+    def __len__(self): return len(self.paths)
+
+    def __getitem__(self, idx):
+        p = self.paths[idx]
+        with Image.open(p) as im:
+            im = im.convert("RGB")
+        x = self.transform(im)
+        return x
