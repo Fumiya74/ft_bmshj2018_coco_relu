@@ -29,7 +29,7 @@ def replace_gdn_with_relu(module: nn.Module) -> nn.Module:
     return module
 
 def set_trainable_parts(model: nn.Module, mode: str = "decoder"):
-    """mode in {'decoder', 'decoder+encoder', 'all'}"""
+    """mode in {'decoder', 'encoder', 'decoder+encoder', 'all'}"""
     mode = mode.lower()
     for p in model.parameters():
         p.requires_grad = False
@@ -40,12 +40,21 @@ def set_trainable_parts(model: nn.Module, mode: str = "decoder"):
         return
 
     # CompressAI の一般的な命名: g_a (encoder), g_s (decoder)
-    if hasattr(model, "g_s"):
+    if mode == "decoder" and hasattr(model, "g_s"):
         for p in model.g_s.parameters():
             p.requires_grad = True
-    if mode == "decoder+encoder" and hasattr(model, "g_a"):
+
+    elif mode == "encoder" and hasattr(model, "g_a"):
         for p in model.g_a.parameters():
             p.requires_grad = True
+
+    elif mode == "decoder+encoder":
+        if hasattr(model, "g_s"):
+            for p in model.g_s.parameters():
+                p.requires_grad = True
+        if hasattr(model, "g_a"):
+            for p in model.g_a.parameters():
+                p.requires_grad = True
 
 def forward_reconstruction(model, x):
     """CompressAI モデルの出力から再構成画像 x_hat を取り出す。"""
