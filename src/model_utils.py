@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple
 from typing import Iterable
+from typing import Sequence
 
 def _is_gdn(m: nn.Module) -> bool:
     # compressai.layers.GDN を優先しつつ、名前ベースでも判定（独自GDN対策）
