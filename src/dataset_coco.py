@@ -30,6 +30,9 @@ class ImageFolder224(Dataset):
                 T.ToTensor(),
             ])
 
+        # 読み込み枚数を表示
+        print(f"[{self.split}] {len(self.paths)} images found")
+
     def __len__(self):
         return len(self.paths)
 
