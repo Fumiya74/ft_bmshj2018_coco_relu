@@ -84,7 +84,8 @@ def save_val_recons(model, loader, device, save_root, tag, wb=None, grid_max=16)
     grid_samples = []
     for x in loader:
         x = x.to(device)
-        x_hat = forward_reconstruction(model, x).clamp(0, 1)
+        # ★ 保存用途は clamp=True（0..1）
+        x_hat = forward_reconstruction(model, x, clamp=True)
 
         bs = x_hat.size(0)
         for b in range(bs):
@@ -125,9 +126,9 @@ def main():
 
     # Model
     model = bmshj2018_factorized(quality=args.quality, pretrained=True)
-    model = replace_gdn_with_relu(model, mode=args.train_parts)
+    model = replace_gdn_with_relu(model, mode=args.train_parts)  # ★ 学習対象だけ置換
     model.to(args.device)
-    set_trainable_parts(model, args.train_parts)
+    set_trainable_parts(model, args.train_parts)                 # ★ 学習対象だけ requires_grad=True
 
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=(args.device.startswith("cuda")))
@@ -158,7 +159,8 @@ def main():
             x = x.to(args.device)
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(args.device.startswith("cuda"))):
-                x_hat = forward_reconstruction(model, x)
+                # ★ 損失計算では clamp=False（勾配に影響させない）
+                x_hat = forward_reconstruction(model, x, clamp=False)
                 loss, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
 
             scaler.scale(loss).backward()
@@ -166,15 +168,16 @@ def main():
             scaler.update()
 
             avg_loss += loss.item()
+            # ★ メトリクスは clamp して安全に
             cur_msssim = logs['ms_ssim'].item()
-            cur_psnr   = psnr(x_hat.detach(), x).item()
+            cur_psnr   = psnr(x_hat.detach().clamp(0, 1), x).item()
 
             pbar.set_postfix({"loss": f"{loss.item():.4f}", "msssim": f"{cur_msssim:.4f}", "psnr": f"{cur_psnr:.2f}"})
             if wb:
                 wb.log({
                     "train/loss": loss.item(),
                     "train/msssim": cur_msssim,
-                    "train/psnr": cur_psnr,   # ★ 追加
+                    "train/psnr": cur_psnr,
                 })
 
         avg_loss /= max(1, len(train_loader))
@@ -185,7 +188,8 @@ def main():
         with torch.no_grad():
             for x in val_loader:
                 x = x.to(args.device)
-                x_hat = forward_reconstruction(model, x)
+                # ★ 評価/保存は clamp=True 推奨
+                x_hat = forward_reconstruction(model, x, clamp=True)
                 _, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
                 mss_list.append(logs["ms_ssim"].item())
                 psnr_list.append(psnr(x_hat, x).item())
@@ -196,7 +200,7 @@ def main():
         if wb:
             wb.log({
                 "val/ms_ssim": mean_mss,
-                "val/psnr": mean_ps,  # ★ 既存に加え明示
+                "val/psnr": mean_ps,
                 "epoch": epoch+1
             })
         print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB  avg_loss={avg_loss:.4f}")
@@ -225,3 +229,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
