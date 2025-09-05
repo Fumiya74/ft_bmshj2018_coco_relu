@@ -30,7 +30,7 @@ def get_args():
     ap.add_argument("--recon_dir", type=str, default="./recon")
     ap.add_argument("--recon_every", type=int, default=2)
     ap.add_argument("--recon_count", type=int, default=16)
-    ap.add_argument("--train_parts", type=str, default="decoder", choices=["decoder","decoder+encoder","all"])
+    ap.add_argument("--train_parts", type=str, default="all", choices=["encoder","decoder","decoder+encoder","all"])
     ap.add_argument("--resume", type=str, default="")
     ap.add_argument("--wandb", type=str, default="false", help='true で W&B を有効化')
     return ap.parse_args()
@@ -42,7 +42,27 @@ def maybe_init_wandb(args):
         return None
     try:
         import wandb
-        wandb.init(project=os.environ.get("WANDB_PROJECT", "bmshj2018_relu"), config=vars(args))
+        run_id_file = Path(args.save_dir) / "wandb_run_id.txt"
+
+        if args.resume and run_id_file.exists():
+            # 再開 → 前回と同じ run_id を使う
+            run_id = run_id_file.read_text().strip()
+            resume_mode = "allow"
+            print(f"[wandb] Resuming previous run (id={run_id})")
+        else:
+            # 新規実行 → run_id に train_parts を埋め込んで保存
+            base_id = wandb.util.generate_id()
+            run_id = f"{base_id}_{args.train_parts}"
+            run_id_file.write_text(run_id)
+            resume_mode = None
+            print(f"[wandb] Starting new run (id={run_id})")
+
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "bmshj2018_relu"),
+            config=vars(args),
+            id=run_id,
+            resume=resume_mode
+        )
         return wandb
     except Exception as e:
         print(f"W&B 無効化: {e}")
