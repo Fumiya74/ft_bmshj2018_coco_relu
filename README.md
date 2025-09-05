@@ -43,16 +43,16 @@ python -m scripts.coco_prepare     --coco_dir /path/to/coco2017     --out_dir  /
 ## 3. 学習（ReLU 置換モデルのファインチューニング）
 
 ```bash
-python -m src.train_finetune_relu     --coco_dir /path/to/coco224     --use_prepared true     --quality 8     --epochs 10     --batch_size 16     --lr 1e-4     --alpha_l1 0.4     --train_parts decoder     --recon_every 2     --recon_count 16     --save_dir ./checkpoints     --recon_dir ./recon
+python -m src.train_finetune_relu     --coco_dir /path/to/coco224     --use_prepared true     --quality 8     --epochs 10     --batch_size 16     --lr 1e-4     --alpha_l1 0.4     --train_parts all     --recon_every 2     --recon_count 16     --save_dir ./checkpoints     --recon_dir ./recon
 ```
 
 ### 主な引数
 - `--quality`: CompressAI の画質インデックス（0〜8）。
 - `--train_parts`: 学習対象を選択  
-  - `decoder`（既定）: デコーダ側のみ学習  
+  - `decoder`: デコーダ側のみ学習  
   - `encoder`: エンコーダ側のみ学習  
   - `decoder+encoder`: 両方学習  
-  - `all`: 全体学習
+  - `all` (Default): 全体学習
 - `--alpha_l1`: 損失関数の L1 重み。`loss = alpha*L1 + (1-alpha)*(1-MS‑SSIM)`
 - `--use_prepared`: `true` の場合、事前クロップ済みデータを使用。
 - `--recon_every`: 何エポックごとに再構成画像を保存するか。
