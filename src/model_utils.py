@@ -1,32 +1,62 @@
 import torch
 import torch.nn as nn
 from typing import Tuple
+from typing import Iterable
 
-def _try_import_gdn():
+def _is_gdn(m: nn.Module) -> bool:
+    # compressai.layers.GDN を優先しつつ、名前ベースでも判定（独自GDN対策）
     try:
         from compressai.layers import GDN
-        return GDN
+        if isinstance(m, GDN):
+            return True
     except Exception:
-        # 古いバージョン互換
-        try:
-            from compressai.layers.gdn import GDN
-            return GDN
-        except Exception:
-            return None
+        pass
+    name = m.__class__.__name__.lower()
+    return "gdn" in name or "generalizeddivisivenorm" in name
 
-def replace_gdn_with_relu(module: nn.Module) -> nn.Module:
-    """CompressAI モデル内部の GDN/IGDN を ReLU に差し替える（inplace）。"""
-    GDN = _try_import_gdn()
+def _replace_gdn_in_module(module: nn.Module) -> int:
+    """
+    module 直下の submodule を走査し、GDNを ReLU(inplace=True) に置換。
+    戻り値: 置換件数
+    """
+    replaced = 0
+    for name, child in list(module.named_children()):
+        if _is_gdn(child):
+            setattr(module, name, nn.ReLU(inplace=True))
+            replaced += 1
+        else:
+            replaced += _replace_gdn_in_module(child)
+    return replaced
 
-    def _replace(m: nn.Module, prefix=""):
-        for name, child in list(m.named_children()):
-            # 再帰的に探索
-            _replace(child, prefix + name + ".")
-            if GDN is not None and isinstance(child, GDN):
-                # child.inverse で IGDN かどうかが分かるが、いずれも ReLU へ
-                setattr(m, name, nn.ReLU(inplace=True))
-    _replace(module)
-    return module
+def replace_gdn_with_relu(model: nn.Module, mode: str = "decoder") -> nn.Module:
+    """
+    GDN -> ReLU 置換を、学習対象パートだけに限定して実行。
+    mode in {'decoder', 'encoder', 'decoder+encoder', 'all'}
+    """
+    mode = mode.lower()
+    replaced_total = 0
+
+    # モデルが g_a/g_s を持つ（CompressAI系の典型）場合は部位限定で置換
+    has_ga = hasattr(model, "g_a") and isinstance(getattr(model, "g_a"), nn.Module)
+    has_gs = hasattr(model, "g_s") and isinstance(getattr(model, "g_s"), nn.Module)
+
+    if has_ga or has_gs:
+        if mode in ("all", "decoder+encoder", "encoder"):
+            if has_ga:
+                replaced_total += _replace_gdn_in_module(model.g_a)
+        if mode in ("all", "decoder+encoder", "decoder"):
+            if has_gs:
+                replaced_total += _replace_gdn_in_module(model.g_s)
+    else:
+        # g_a / g_s が無い特殊モデルの場合：
+        # - 'all' / 'decoder+encoder' はモデル全体を対象
+        # - 'encoder' / 'decoder' は部位特定ができないため全体置換かスキップを選ぶ
+        #   → 実運用では全体置換のほうが分かりやすいので全体置換にしています。
+        if mode in ("all", "decoder+encoder", "encoder", "decoder"):
+            replaced_total += _replace_gdn_in_module(model)
+
+    print(f"[replace_gdn_with_relu] Replaced {replaced_total} GDN(s) -> ReLU (mode='{mode}')")
+    return model
 
 def set_trainable_parts(model: nn.Module, mode: str = "decoder"):
     """mode in {'decoder', 'encoder', 'decoder+encoder', 'all'}"""

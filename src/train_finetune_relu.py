@@ -125,7 +125,7 @@ def main():
 
     # Model
     model = bmshj2018_factorized(quality=args.quality, pretrained=True)
-    model = replace_gdn_with_relu(model)
+    model = replace_gdn_with_relu(model, mode=args.train_parts)
     model.to(args.device)
     set_trainable_parts(model, args.train_parts)
 
