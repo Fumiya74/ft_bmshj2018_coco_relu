@@ -1,9 +1,10 @@
-import argparse, os, json, time, math
+import argparse, os, time
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+import torchvision.utils as vutils
 from torchvision.utils import save_image
 from tqdm import tqdm
 
@@ -11,6 +12,7 @@ from compressai.zoo import bmshj2018_factorized
 from src.dataset_coco import ImageFolder224
 from src.losses import recon_loss, psnr
 from src.model_utils import replace_gdn_with_relu, set_trainable_parts, forward_reconstruction
+
 
 def get_args():
     ap = argparse.ArgumentParser()
@@ -30,27 +32,76 @@ def get_args():
     ap.add_argument("--recon_count", type=int, default=16)
     ap.add_argument("--train_parts", type=str, default="decoder", choices=["decoder","decoder+encoder","all"])
     ap.add_argument("--resume", type=str, default="")
-    ap.add_argument("--wandb", type=str, default="false")
+    ap.add_argument("--wandb", type=str, default="false", help='true で W&B を有効化')
     return ap.parse_args()
+
+
+def maybe_init_wandb(args):
+    use = args.wandb.lower() == "true" and (os.environ.get("WANDB_DISABLED","false").lower() != "true")
+    if not use:
+        return None
+    try:
+        import wandb
+        wandb.init(project=os.environ.get("WANDB_PROJECT", "bmshj2018_relu"), config=vars(args))
+        return wandb
+    except Exception as e:
+        print(f"W&B 無効化: {e}")
+        return None
+
+
+@torch.no_grad()
+def save_val_recons(model, loader, device, save_root, tag, wb=None, grid_max=16):
+    """
+    Valの固定サブセットに対して、モデルの再構成出力 x_hat のみをPNGで保存。
+    保存先: save_root/tag/00000.png, 00001.png, ...
+    さらに W&B にグリッド画像をログ（ファイル保存はしない）。
+    """
+    model.eval()
+    out_dir = Path(save_root) / tag
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = 0
+    grid_samples = []
+    for x in loader:
+        x = x.to(device)
+        x_hat = forward_reconstruction(model, x).clamp(0, 1)
+
+        bs = x_hat.size(0)
+        for b in range(bs):
+            save_image(x_hat[b], out_dir / f"{saved:05d}.png")
+            if len(grid_samples) < grid_max:
+                grid_samples.append(x_hat[b].cpu())
+            saved += 1
+
+    if wb and len(grid_samples) > 0:
+        grid = vutils.make_grid(grid_samples, nrow=4, padding=2)
+        wb.log({f"recon/{tag}": [wb.Image(grid, caption=tag)]})
+    print(f"[recon] Saved {saved} recon images to {out_dir}")
+
 
 def main():
     args = get_args()
     use_prepared = args.use_prepared.lower() == "true"
-    os.makedirs(args.save_dir, exist_ok=True)
-    os.makedirs(args.recon_dir, exist_ok=True)
+    Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+    Path(args.recon_dir).mkdir(parents=True, exist_ok=True)
 
-    if args.wandb.lower() == "true":
-        import wandb
-        wandb.init(project=os.environ.get("WANDB_PROJECT", "bmshj2018_relu"),
-                   config=vars(args))
-    else:
-        wandb = None
+    wb = maybe_init_wandb(args)
 
     # Data
     tr = ImageFolder224(args.coco_dir, "train", use_prepared=use_prepared, input_size=args.input_size)
     va = ImageFolder224(args.coco_dir, "val",   use_prepared=use_prepared, input_size=args.input_size)
-    train_loader = DataLoader(tr, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_loader   = DataLoader(va, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    train_loader = DataLoader(tr, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, pin_memory=True, drop_last=False)
+    val_loader   = DataLoader(va, batch_size=args.batch_size, shuffle=False,
+                              num_workers=args.num_workers, pin_memory=True)
+
+    # 再構成用：val先頭から固定サブセット
+    recon_n = max(1, min(args.recon_count, len(va))) if len(va) > 0 else 0
+    recon_loader = None
+    if recon_n > 0:
+        recon_subset = Subset(va, list(range(recon_n)))
+        recon_loader = DataLoader(recon_subset, batch_size=min(8, args.batch_size),
+                                  shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
     # Model
     model = bmshj2018_factorized(quality=args.quality, pretrained=True)
@@ -67,50 +118,74 @@ def main():
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(ckpt["model"], strict=False)
-        opt.load_state_dict(ckpt["opt"])
+        if "opt" in ckpt:
+            opt.load_state_dict(ckpt["opt"])
         start_epoch = ckpt.get("epoch", 0) + 1
         best_msssim = ckpt.get("best_msssim", 0.0)
+        print(f"Resumed from {args.resume} (next epoch = {start_epoch})")
+
+    # ★ 学習開始前の再構成画像を保存（固定サブセット）
+    if recon_loader is not None:
+        tag = f"pre_e{start_epoch:03d}"
+        save_val_recons(model, recon_loader, args.device, args.recon_dir, tag, wb=wb,
+                        grid_max=min(16, args.recon_count))
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
         pbar = tqdm(train_loader, desc=f"train e{epoch+1}/{args.epochs}")
         avg_loss = 0.0
-        for x in pbar:
+        for i, x in enumerate(pbar):
             x = x.to(args.device)
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(args.device.startswith("cuda"))):
                 x_hat = forward_reconstruction(model, x)
                 loss, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
+
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
+
             avg_loss += loss.item()
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "msssim": f"{logs['ms_ssim'].item():.4f}"})
-            if wandb: 
-                wandb.log({"train/loss": loss.item(), "train/msssim": logs["ms_ssim"].item()})
+            cur_msssim = logs['ms_ssim'].item()
+            cur_psnr   = psnr(x_hat.detach(), x).item()
+
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "msssim": f"{cur_msssim:.4f}", "psnr": f"{cur_psnr:.2f}"})
+            if wb:
+                wb.log({
+                    "train/loss": loss.item(),
+                    "train/msssim": cur_msssim,
+                    "train/psnr": cur_psnr,   # ★ 追加
+                })
+
         avg_loss /= max(1, len(train_loader))
 
         # Validation
         model.eval()
         mss_list, psnr_list = [], []
         with torch.no_grad():
-            for i, x in enumerate(val_loader):
+            for x in val_loader:
                 x = x.to(args.device)
                 x_hat = forward_reconstruction(model, x)
                 _, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
                 mss_list.append(logs["ms_ssim"].item())
                 psnr_list.append(psnr(x_hat, x).item())
-                # Recon dump
-                if (epoch+1) % args.recon_every == 0 and i == 0:
-                    # 0..1 にクリップして保存
-                    n = min(args.recon_count, x.size(0))
-                    grid = torch.stack([x[:n], x_hat[:n].clamp(0,1)], dim=1).reshape(2*n, *x.shape[1:])
-                    save_image(grid, os.path.join(args.recon_dir, f"e{epoch+1:03d}_recon.png"), nrow=2, padding=2)
+
         mean_mss = sum(mss_list)/len(mss_list) if mss_list else 0.0
         mean_ps  = sum(psnr_list)/len(psnr_list) if psnr_list else 0.0
-        if wandb:
-            wandb.log({"val/ms_ssim": mean_mss, "val/psnr": mean_ps, "epoch": epoch+1})
-        print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB")
+
+        if wb:
+            wb.log({
+                "val/ms_ssim": mean_mss,
+                "val/psnr": mean_ps,  # ★ 既存に加え明示
+                "epoch": epoch+1
+            })
+        print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB  avg_loss={avg_loss:.4f}")
+
+        # ★ 既定の間隔で、再構成画像を PNG で保存（ディレクトリ分割）＋ W&B にグリッドをログ
+        if recon_loader is not None and args.recon_every > 0 and ((epoch + 1) % args.recon_every == 0):
+            tag = f"e{epoch+1:03d}"
+            save_val_recons(model, recon_loader, args.device, args.recon_dir, tag, wb=wb,
+                            grid_max=min(16, args.recon_count))
 
         # Save
         ckpt = {
@@ -126,6 +201,7 @@ def main():
             torch.save(ckpt, os.path.join(args.save_dir, f"best_msssim.pt"))
 
     print("Done.")
+
 
 if __name__ == "__main__":
     main()
