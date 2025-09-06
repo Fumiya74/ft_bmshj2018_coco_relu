@@ -234,6 +234,14 @@ def main():
                 "lr": f"{opt.param_groups[0]['lr']:.2e}",
                 "amp": int(amp_enabled),
             })
+            if wb:
+                wb.log({
+                    "train/loss": float(loss),
+                    "train/msssim": cur_msssim,
+                    "train/psnr": cur_psnr,
+                    "train/lr": opt.param_groups[0]["lr"],
+                    "train/amp_enabled": int(amp_enabled),
+                }, step=global_step)
 
             global_step += 1
 
@@ -254,7 +262,12 @@ def main():
         mean_ps  = sum(psnr_list)/len(psnr_list) if psnr_list else 0.0
 
         print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB  avg_loss={avg_loss:.4f}")
-
+        if wb:
+            wb.log({
+                "val/ms_ssim": mean_mss,
+                "val/psnr": mean_ps,
+                "epoch": epoch+1
+            }, step=global_step)
         # Save
         ckpt = {
             "epoch": epoch,
