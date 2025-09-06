@@ -1,9 +1,7 @@
-
-import argparse, os, time
+import argparse, os
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 import torchvision.utils as vutils
 from torchvision.utils import save_image
@@ -13,7 +11,6 @@ from compressai.zoo import bmshj2018_factorized
 from src.dataset_coco import ImageFolder224
 from src.losses import recon_loss, psnr
 from src.model_utils import replace_gdn_with_relu, set_trainable_parts, forward_reconstruction
-
 
 def get_args():
     ap = argparse.ArgumentParser()
@@ -31,11 +28,18 @@ def get_args():
     ap.add_argument("--recon_dir", type=str, default="./recon")
     ap.add_argument("--recon_every", type=int, default=2)
     ap.add_argument("--recon_count", type=int, default=16)
-    ap.add_argument("--train_parts", type=str, default="all", choices=["encoder","decoder","decoder+encoder","all"])
-    ap.add_argument("--resume", type=str, default="")
-    ap.add_argument("--wandb", type=str, default="false", help='true で W&B を有効化')
-    return ap.parse_args()
 
+    # 追加: 置換対象と再学習スコープ
+    ap.add_argument("--replace_parts", type=str, default="encoder",
+                    choices=["encoder","decoder","all"],
+                    help="GDN→ReLU 置換を行うブロック")
+    ap.add_argument("--train_scope", type=str, default="replaced",
+                    choices=["replaced","replaced+hyper","all"],
+                    help="再学習する範囲：置換ブロックのみ / 置換+hyperprior+entropy_bottleneck / 全層")
+
+    ap.add_argument("--resume", type=str, default="")
+    ap.add_argument("--wandb", type=str, default="false", help="true で W&B を有効化")
+    return ap.parse_args()
 
 def maybe_init_wandb(args):
     use = args.wandb.lower() == "true" and (os.environ.get("WANDB_DISABLED","false").lower() != "true")
@@ -44,20 +48,16 @@ def maybe_init_wandb(args):
     try:
         import wandb
         run_id_file = Path(args.save_dir) / "wandb_run_id.txt"
-
         if args.resume and run_id_file.exists():
-            # 再開 → 前回と同じ run_id を使う
             run_id = run_id_file.read_text().strip()
             resume_mode = "allow"
             print(f"[wandb] Resuming previous run (id={run_id})")
         else:
-            # 新規実行 → run_id に train_parts を埋め込んで保存
             base_id = wandb.util.generate_id()
-            run_id = f"{base_id}_{args.train_parts}"
+            run_id = f"{base_id}_{args.replace_parts}_{args.train_scope}"
             run_id_file.write_text(run_id)
             resume_mode = None
             print(f"[wandb] Starting new run (id={run_id})")
-
         wandb.init(
             project=os.environ.get("WANDB_PROJECT", "bmshj2018_relu"),
             config=vars(args),
@@ -69,44 +69,32 @@ def maybe_init_wandb(args):
         print(f"W&B 無効化: {e}")
         return None
 
-
 @torch.no_grad()
 def save_val_recons(model, loader, device, save_root, tag, wb=None, grid_max=16):
-    """
-    Valの固定サブセットに対して、モデルの再構成出力 x_hat のみをPNGで保存。
-    保存先: save_root/tag/00000.png, 00001.png, ...
-    さらに W&B にグリッド画像をログ（ファイル保存はしない）。
-    """
     model.eval()
     out_dir = Path(save_root) / tag
     out_dir.mkdir(parents=True, exist_ok=True)
-
     saved = 0
     grid_samples = []
     for x in loader:
         x = x.to(device)
-        # ★ 保存用途は clamp=True（0..1）
         x_hat = forward_reconstruction(model, x, clamp=True)
-
         bs = x_hat.size(0)
         for b in range(bs):
             save_image(x_hat[b], out_dir / f"{saved:05d}.png")
             if len(grid_samples) < grid_max:
                 grid_samples.append(x_hat[b].cpu())
             saved += 1
-
     if wb and len(grid_samples) > 0:
         grid = vutils.make_grid(grid_samples, nrow=4, padding=2)
         wb.log({f"recon/{tag}": [wb.Image(grid, caption=tag)]})
     print(f"[recon] Saved {saved} recon images to {out_dir}")
-
 
 def main():
     args = get_args()
     use_prepared = args.use_prepared.lower() == "true"
     Path(args.save_dir).mkdir(parents=True, exist_ok=True)
     Path(args.recon_dir).mkdir(parents=True, exist_ok=True)
-
     wb = maybe_init_wandb(args)
 
     # Data
@@ -117,7 +105,7 @@ def main():
     val_loader   = DataLoader(va, batch_size=args.batch_size, shuffle=False,
                               num_workers=args.num_workers, pin_memory=True)
 
-    # 再構成用：val先頭から固定サブセット
+    # 再構成保存用サブセット
     recon_n = max(1, min(args.recon_count, len(va))) if len(va) > 0 else 0
     recon_loader = None
     if recon_n > 0:
@@ -127,9 +115,9 @@ def main():
 
     # Model
     model = bmshj2018_factorized(quality=args.quality, pretrained=True)
-    model = replace_gdn_with_relu(model, mode=args.train_parts)  # ★ 学習対象だけ置換（ReLUは非インプレース）
+    model = replace_gdn_with_relu(model, mode=args.replace_parts)  # 置換
     model.to(args.device)
-    set_trainable_parts(model, args.train_parts)                 # ★ 学習対象だけ requires_grad=True
+    set_trainable_parts(model, replaced_block=args.replace_parts, train_scope=args.train_scope)  # 再学習範囲
 
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     use_amp = args.device.startswith("cuda")
@@ -137,7 +125,6 @@ def main():
 
     best_msssim = 0.0
     start_epoch = 0
-
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(ckpt["model"], strict=False)
@@ -147,7 +134,7 @@ def main():
         best_msssim = ckpt.get("best_msssim", 0.0)
         print(f"Resumed from {args.resume} (next epoch = {start_epoch})")
 
-    # ★ 学習開始前の再構成画像を保存（固定サブセット）
+    # 事前の再構成保存
     if recon_loader is not None:
         tag = f"pre_e{start_epoch:03d}"
         save_val_recons(model, recon_loader, args.device, args.recon_dir, tag, wb=wb,
@@ -157,34 +144,23 @@ def main():
         model.train()
         pbar = tqdm(train_loader, desc=f"train e{epoch+1}/{args.epochs}")
         avg_loss = 0.0
-        for i, x in enumerate(pbar):
+        for x in pbar:
             x = x.to(args.device)
             opt.zero_grad(set_to_none=True)
-
-            # 1) モデルの順伝播は AMP で OK
             with torch.cuda.amp.autocast(enabled=use_amp):
                 x_hat = forward_reconstruction(model, x, clamp=False)
-
-            # 2) 損失は FP32 で安全に（MS-SSIM は 0..1 前提）
             with torch.cuda.amp.autocast(enabled=False):
                 loss, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
-
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
 
             avg_loss += float(loss.detach().cpu())
-            # ★ メトリクスは clamp して安全に
-            cur_msssim = float(logs['ms_ssim'])
+            cur_msssim = float(logs["ms_ssim"])
             cur_psnr   = psnr(x_hat.detach().clamp(0, 1), x).item()
-
             pbar.set_postfix({"loss": f"{float(loss):.4f}", "msssim": f"{cur_msssim:.4f}", "psnr": f"{cur_psnr:.2f}"})
             if wb:
-                wb.log({
-                    "train/loss": float(loss),
-                    "train/msssim": cur_msssim,
-                    "train/psnr": cur_psnr,
-                })
+                wb.log({"train/loss": float(loss), "train/msssim": cur_msssim, "train/psnr": cur_psnr})
 
         avg_loss /= max(1, len(train_loader))
 
@@ -194,7 +170,6 @@ def main():
         with torch.no_grad():
             for x in val_loader:
                 x = x.to(args.device)
-                # ★ 評価/保存は clamp=True 推奨
                 x_hat = forward_reconstruction(model, x, clamp=True)
                 _, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
                 mss_list.append(float(logs["ms_ssim"]))
@@ -204,14 +179,10 @@ def main():
         mean_ps  = sum(psnr_list)/len(psnr_list) if psnr_list else 0.0
 
         if wb:
-            wb.log({
-                "val/ms_ssim": mean_mss,
-                "val/psnr": mean_ps,
-                "epoch": epoch+1
-            })
+            wb.log({"val/ms_ssim": mean_mss, "val/psnr": mean_ps, "epoch": epoch+1})
         print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB  avg_loss={avg_loss:.4f}")
 
-        # ★ 既定の間隔で、再構成画像を PNG で保存（ディレクトリ分割）＋ W&B にグリッドをログ
+        # 再構成保存
         if recon_loader is not None and args.recon_every > 0 and ((epoch + 1) % args.recon_every == 0):
             tag = f"e{epoch+1:03d}"
             save_val_recons(model, recon_loader, args.device, args.recon_dir, tag, wb=wb,
@@ -225,13 +196,13 @@ def main():
             "best_msssim": max(best_msssim, mean_mss),
             "args": vars(args),
         }
-        torch.save(ckpt, os.path.join(args.save_dir, f"last.pt"))
+        Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+        torch.save(ckpt, os.path.join(args.save_dir, "last.pt"))
         if mean_mss > best_msssim:
             best_msssim = mean_mss
-            torch.save(ckpt, os.path.join(args.save_dir, f"best_msssim.pt"))
+            torch.save(ckpt, os.path.join(args.save_dir, "best_msssim.pt"))
 
     print("Done.")
-
 
 if __name__ == "__main__":
     main()

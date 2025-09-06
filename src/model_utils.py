@@ -1,7 +1,6 @@
-
 import torch
 import torch.nn as nn
-from typing import Tuple, Sequence
+from typing import Sequence
 
 def _is_gdn(m: nn.Module) -> bool:
     # compressai.layers.GDN を優先しつつ、名前ベースでも判定（独自GDN対策）
@@ -22,67 +21,83 @@ def _replace_gdn_in_module(module: nn.Module) -> int:
     replaced = 0
     for name, child in list(module.named_children()):
         if _is_gdn(child):
-            # ★ インプレースは禁止（勾配保存が壊れて encoder に勾配が戻らない/NAN の一因になる）
+            # インプレースは禁止（勾配保存を壊す可能性）
             setattr(module, name, nn.ReLU(inplace=False))
             replaced += 1
         else:
             replaced += _replace_gdn_in_module(child)
     return replaced
 
-def replace_gdn_with_relu(model: nn.Module, mode: str = "decoder") -> nn.Module:
+def replace_gdn_with_relu(model: nn.Module, mode: str = "encoder") -> nn.Module:
     """
-    GDN -> ReLU 置換を、学習対象パートだけに限定して実行。
-    mode in {'decoder', 'encoder', 'decoder+encoder', 'all'}
+    GDN -> ReLU 置換。
+    mode in {'encoder', 'decoder', 'all'}
     """
     mode = mode.lower()
-    replaced_total = 0
+    if mode not in {"encoder", "decoder", "all"}:
+        raise ValueError(f"replace_gdn_with_relu: mode must be one of 'encoder','decoder','all', got {mode}")
 
-    # モデルが g_a/g_s を持つ（CompressAI系の典型）場合は部位限定で置換
+    replaced_total = 0
     has_ga = hasattr(model, "g_a") and isinstance(getattr(model, "g_a"), nn.Module)
     has_gs = hasattr(model, "g_s") and isinstance(getattr(model, "g_s"), nn.Module)
 
-    if has_ga or has_gs:
-        if mode in ("all", "decoder+encoder", "encoder"):
-            if has_ga:
-                replaced_total += _replace_gdn_in_module(model.g_a)
-        if mode in ("all", "decoder+encoder", "decoder"):
-            if has_gs:
-                replaced_total += _replace_gdn_in_module(model.g_s)
-    else:
-        # g_a / g_s が無い特殊モデルの場合は全体置換
-        if mode in ("all", "decoder+encoder", "encoder", "decoder"):
+    if mode in ("encoder", "all"):
+        if has_ga:
+            replaced_total += _replace_gdn_in_module(model.g_a)
+        else:
+            replaced_total += _replace_gdn_in_module(model)
+    if mode in ("decoder", "all"):
+        if has_gs:
+            replaced_total += _replace_gdn_in_module(model.g_s)
+        else:
             replaced_total += _replace_gdn_in_module(model)
 
     print(f"[replace_gdn_with_relu] Replaced {replaced_total} GDN(s) -> ReLU (mode='{mode}')")
     return model
 
-def set_trainable_parts(model: nn.Module, mode: str = "decoder"):
-    """mode in {'decoder', 'encoder', 'decoder+encoder', 'all'}"""
-    mode = mode.lower()
+def set_trainable_parts(model: nn.Module, replaced_block: str = "encoder", train_scope: str = "replaced"):
+    """
+    再学習範囲の設定。
+    replaced_block in {'encoder','decoder','all'}  … GDN置換を行ったブロックの指定
+    train_scope    in {'replaced','replaced+hyper','all'} … 再学習する範囲
+      - 'replaced'           : 置換したブロックのみ（encoder→g_a / decoder→g_s / all→g_a+g_s）
+      - 'replaced+hyper'     : 上に加えて hyperprior 系（h_a, h_s, entropy_bottleneck）も更新
+      - 'all'                : 全層を更新
+    """
+    replaced_block = replaced_block.lower()
+    train_scope = train_scope.lower()
+    if replaced_block not in {"encoder","decoder","all"}:
+        raise ValueError("set_trainable_parts: replaced_block must be 'encoder','decoder','all'")
+    if train_scope not in {"replaced","replaced+hyper","all"}:
+        raise ValueError("set_trainable_parts: train_scope must be 'replaced','replaced+hyper','all'")
+
+    # まず全て停止
     for p in model.parameters():
         p.requires_grad = False
 
-    if mode == "all":
+    if train_scope == "all":
         for p in model.parameters():
             p.requires_grad = True
         return
 
-    # CompressAI の一般的な命名: g_a (encoder), g_s (decoder)
-    if mode == "decoder" and hasattr(model, "g_s"):
-        for p in model.g_s.parameters():
+    # ユーティリティ：存在する場合に requires_grad=True を立てる
+    def _enable(module: nn.Module | None):
+        if module is None:
+            return
+        for p in module.parameters():
             p.requires_grad = True
 
-    elif mode == "encoder" and hasattr(model, "g_a"):
-        for p in model.g_a.parameters():
-            p.requires_grad = True
+    # 置換ブロック
+    if replaced_block in {"encoder","all"} and hasattr(model, "g_a"):
+        _enable(model.g_a)
+    if replaced_block in {"decoder","all"} and hasattr(model, "g_s"):
+        _enable(model.g_s)
 
-    elif mode == "decoder+encoder":
-        if hasattr(model, "g_s"):
-            for p in model.g_s.parameters():
-                p.requires_grad = True
-        if hasattr(model, "g_a"):
-            for p in model.g_a.parameters():
-                p.requires_grad = True
+    if train_scope == "replaced+hyper":
+        # hyperprior 系（存在すれば）
+        _enable(getattr(model, "h_a", None))
+        _enable(getattr(model, "h_s", None))
+        _enable(getattr(model, "entropy_bottleneck", None))  # Module だが .parameters() を持つ
 
 @torch.no_grad()
 def _is_tensor_safe(x: torch.Tensor) -> bool:
@@ -117,11 +132,7 @@ def forward_reconstruction(
 ):
     """
     モデルの forward から再構成 x_hat を安全に取り出すユーティリティ。
-
-    - CompressAI の bmshj2018_factorized は dict を返し、その中の 'x_hat' が再構成画像。
-    - 学習・推論の両方で使用可能（学習時に勾配を切らない）。
-    - clamp=False が既定（学習の勾配を阻害しない）。保存/メトリクス時は外側で clamp するか、
-      clamp=True を指定してください。
+    - 学習時に勾配を切らない（clamp=False が既定）。
     """
     out = model(x)  # 勾配を保持
     x_hat = _pick_x_hat(out, key_candidates)
