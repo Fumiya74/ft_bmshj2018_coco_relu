@@ -1,8 +1,7 @@
+
 import torch
 import torch.nn as nn
-from typing import Tuple
-from typing import Iterable
-from typing import Sequence
+from typing import Tuple, Sequence
 
 def _is_gdn(m: nn.Module) -> bool:
     # compressai.layers.GDN を優先しつつ、名前ベースでも判定（独自GDN対策）
@@ -17,13 +16,14 @@ def _is_gdn(m: nn.Module) -> bool:
 
 def _replace_gdn_in_module(module: nn.Module) -> int:
     """
-    module 直下の submodule を走査し、GDNを ReLU(inplace=True) に置換。
+    module 直下の submodule を走査し、GDNを ReLU(inplace=False) に置換。
     戻り値: 置換件数
     """
     replaced = 0
     for name, child in list(module.named_children()):
         if _is_gdn(child):
-            setattr(module, name, nn.ReLU(inplace=True))
+            # ★ インプレースは禁止（勾配保存が壊れて encoder に勾配が戻らない/NAN の一因になる）
+            setattr(module, name, nn.ReLU(inplace=False))
             replaced += 1
         else:
             replaced += _replace_gdn_in_module(child)
@@ -49,10 +49,7 @@ def replace_gdn_with_relu(model: nn.Module, mode: str = "decoder") -> nn.Module:
             if has_gs:
                 replaced_total += _replace_gdn_in_module(model.g_s)
     else:
-        # g_a / g_s が無い特殊モデルの場合：
-        # - 'all' / 'decoder+encoder' はモデル全体を対象
-        # - 'encoder' / 'decoder' は部位特定ができないため全体置換かスキップを選ぶ
-        #   → 実運用では全体置換のほうが分かりやすいので全体置換にしています。
+        # g_a / g_s が無い特殊モデルの場合は全体置換
         if mode in ("all", "decoder+encoder", "encoder", "decoder"):
             replaced_total += _replace_gdn_in_module(model)
 
@@ -117,7 +114,7 @@ def forward_reconstruction(
     clamp_max: float = 1.0,
     key_candidates: Sequence[str] = ("x_hat", "x", "recon", "x_dec", "x_out"),
     return_all: bool = False,
-) -> torch.Tensor | Tuple[torch.Tensor, object]:
+):
     """
     モデルの forward から再構成 x_hat を安全に取り出すユーティリティ。
 
@@ -125,17 +122,6 @@ def forward_reconstruction(
     - 学習・推論の両方で使用可能（学習時に勾配を切らない）。
     - clamp=False が既定（学習の勾配を阻害しない）。保存/メトリクス時は外側で clamp するか、
       clamp=True を指定してください。
-
-    Args:
-        model: nn.Module
-        x: 入力画像 (B, C, H, W), 0..1 期待
-        clamp: 0..1 に丸めたい場合 True（既定 False）
-        clamp_min, clamp_max: clamp 範囲
-        key_candidates: dict 出力時に x_hat 候補として探索するキー名の優先順
-        return_all: True のとき (x_hat, raw_out) を返す
-
-    Returns:
-        x_hat もしくは (x_hat, raw_out)
     """
     out = model(x)  # 勾配を保持
     x_hat = _pick_x_hat(out, key_candidates)
@@ -143,28 +129,4 @@ def forward_reconstruction(
     if clamp:
         x_hat = x_hat.clamp(clamp_min, clamp_max)
 
-    # 早期に致命的な値を検出（デバッグ向け、学習の邪魔はしない）
-    # コメントアウトしたい場合は下2行を消してください
-    # if not _is_tensor_safe(x_hat):
-    #     raise RuntimeError("forward_reconstruction: x_hat contains NaN/Inf")
-
     return (x_hat, out) if return_all else x_hat
-
-"""
-def forward_reconstruction(model, x):
-    #CompressAI モデルの出力から再構成画像 x_hat を取り出す。
-    out = model(x)
-    if isinstance(out, dict):
-        x_hat = out.get("x_hat", None)
-    else:
-        x_hat = getattr(out, "x_hat", None)
-    if x_hat is None:
-        # 互換性フォールバック
-        if hasattr(model, "g_s") and hasattr(model, "g_a"):
-            # Entropy bottleneck等を無視して解析/合成のみ（学習外用途）
-            y = model.g_a(x)
-            x_hat = model.g_s(y)
-        else:
-            raise RuntimeError("Cannot extract x_hat from model output.")
-    return x_hat
-"""

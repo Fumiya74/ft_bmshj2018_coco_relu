@@ -1,3 +1,4 @@
+
 import argparse, os, time
 from pathlib import Path
 
@@ -126,12 +127,13 @@ def main():
 
     # Model
     model = bmshj2018_factorized(quality=args.quality, pretrained=True)
-    model = replace_gdn_with_relu(model, mode=args.train_parts)  # ★ 学習対象だけ置換
+    model = replace_gdn_with_relu(model, mode=args.train_parts)  # ★ 学習対象だけ置換（ReLUは非インプレース）
     model.to(args.device)
     set_trainable_parts(model, args.train_parts)                 # ★ 学習対象だけ requires_grad=True
 
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.device.startswith("cuda")))
+    use_amp = args.device.startswith("cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     best_msssim = 0.0
     start_epoch = 0
@@ -158,24 +160,28 @@ def main():
         for i, x in enumerate(pbar):
             x = x.to(args.device)
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(args.device.startswith("cuda"))):
-                # ★ 損失計算では clamp=False（勾配に影響させない）
+
+            # 1) モデルの順伝播は AMP で OK
+            with torch.cuda.amp.autocast(enabled=use_amp):
                 x_hat = forward_reconstruction(model, x, clamp=False)
+
+            # 2) 損失は FP32 で安全に（MS-SSIM は 0..1 前提）
+            with torch.cuda.amp.autocast(enabled=False):
                 loss, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
 
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
 
-            avg_loss += loss.item()
+            avg_loss += float(loss.detach().cpu())
             # ★ メトリクスは clamp して安全に
-            cur_msssim = logs['ms_ssim'].item()
+            cur_msssim = float(logs['ms_ssim'])
             cur_psnr   = psnr(x_hat.detach().clamp(0, 1), x).item()
 
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "msssim": f"{cur_msssim:.4f}", "psnr": f"{cur_psnr:.2f}"})
+            pbar.set_postfix({"loss": f"{float(loss):.4f}", "msssim": f"{cur_msssim:.4f}", "psnr": f"{cur_psnr:.2f}"})
             if wb:
                 wb.log({
-                    "train/loss": loss.item(),
+                    "train/loss": float(loss),
                     "train/msssim": cur_msssim,
                     "train/psnr": cur_psnr,
                 })
@@ -191,7 +197,7 @@ def main():
                 # ★ 評価/保存は clamp=True 推奨
                 x_hat = forward_reconstruction(model, x, clamp=True)
                 _, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
-                mss_list.append(logs["ms_ssim"].item())
+                mss_list.append(float(logs["ms_ssim"]))
                 psnr_list.append(psnr(x_hat, x).item())
 
         mean_mss = sum(mss_list)/len(mss_list) if mss_list else 0.0
