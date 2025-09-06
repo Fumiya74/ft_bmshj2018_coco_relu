@@ -268,6 +268,12 @@ def main():
                 "val/psnr": mean_ps,
                 "epoch": epoch+1
             })
+            
+        # ★ 既定の間隔で、再構成画像を PNG で保存（ディレクトリ分割）＋ W&B にグリッドをログ
+        if recon_loader is not None and args.recon_every > 0 and ((epoch + 1) % args.recon_every == 0):
+            tag = f"e{epoch+1:03d}"
+            save_val_recons(model, recon_loader, args.device, args.recon_dir, tag, wb=wb,
+                            grid_max=min(16, args.recon_count))
         # Save
         ckpt = {
             "epoch": epoch,
