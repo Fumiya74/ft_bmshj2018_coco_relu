@@ -241,7 +241,7 @@ def main():
                     "train/psnr": cur_psnr,
                     "train/lr": opt.param_groups[0]["lr"],
                     "train/amp_enabled": int(amp_enabled),
-                }, step=global_step)
+                })
 
             global_step += 1
 
@@ -267,7 +267,7 @@ def main():
                 "val/ms_ssim": mean_mss,
                 "val/psnr": mean_ps,
                 "epoch": epoch+1
-            }, step=global_step)
+            })
         # Save
         ckpt = {
             "epoch": epoch,
