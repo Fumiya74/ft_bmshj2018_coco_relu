@@ -1,8 +1,11 @@
+
 import argparse, os
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader, Subset
+from torch.nn.utils import clip_grad_norm_
 import torchvision.utils as vutils
 from torchvision.utils import save_image
 from tqdm import tqdm
@@ -29,13 +32,25 @@ def get_args():
     ap.add_argument("--recon_every", type=int, default=2)
     ap.add_argument("--recon_count", type=int, default=16)
 
-    # 追加: 置換対象と再学習スコープ
+    # 置換対象と再学習スコープ
     ap.add_argument("--replace_parts", type=str, default="encoder",
                     choices=["encoder","decoder","all"],
                     help="GDN→ReLU 置換を行うブロック")
-    ap.add_argument("--train_scope", type=str, default="replaced",
+    ap.add_argument("--train_scope", type=str, default="replaced+hyper",
                     choices=["replaced","replaced+hyper","all"],
-                    help="再学習する範囲：置換ブロックのみ / 置換+hyperprior+entropy_bottleneck / 全層")
+                    help="再学習範囲：置換ブロックのみ / 置換+hyperprior+entropy_bottleneck / 全層")
+
+    # 安定化
+    ap.add_argument("--amp_warmup_steps", type=int, default=100,
+                    help="このステップ数までは AMP を無効化（FP32 で安定化）")
+    ap.add_argument("--lr_warmup_steps", type=int, default=500,
+                    help="線形ウォームアップのステップ数（最大学習率に到達するまで）")
+    ap.add_argument("--max_grad_norm", type=float, default=1.0,
+                    help="勾配クリッピングのしきい値。0 以下で無効")
+    ap.add_argument("--overflow_check", type=str, default="true",
+                    help="true のとき forward 出力に NaN/Inf/過大値があれば即停止")
+    ap.add_argument("--overflow_tol", type=float, default=1e8,
+                    help="過大値（abs>この値）検知で停止")
 
     ap.add_argument("--resume", type=str, default="")
     ap.add_argument("--wandb", type=str, default="false", help="true で W&B を有効化")
@@ -90,9 +105,35 @@ def save_val_recons(model, loader, device, save_root, tag, wb=None, grid_max=16)
         wb.log({f"recon/{tag}": [wb.Image(grid, caption=tag)]})
     print(f"[recon] Saved {saved} recon images to {out_dir}")
 
+def _iter_tensors(obj: Any):
+    if torch.is_tensor(obj):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_tensors(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from _iter_tensors(v)
+
+def _check_overflow(raw_out: Any, tol: float):
+    for t in _iter_tensors(raw_out):
+        if not torch.isfinite(t).all():
+            bad = t[~torch.isfinite(t)]
+            raise RuntimeError(f"[overflow-check] NaN/Inf detected: shape={t.shape}, example={bad.flatten()[:4]}")
+        if (t.abs() > tol).any():
+            big = t[t.abs() > tol]
+            raise RuntimeError(f"[overflow-check] overly large values (>|{tol}|): shape={t.shape}, "
+                               f"max_abs={t.abs().max().item()}, example={big.flatten()[:4]}")
+
+def _set_lr(optimizer: torch.optim.Optimizer, base_lr: float, factor: float):
+    for pg in optimizer.param_groups:
+        pg["lr"] = base_lr * factor
+
 def main():
     args = get_args()
     use_prepared = args.use_prepared.lower() == "true"
+    do_overflow_check = args.overflow_check.lower() == "true"
+
     Path(args.save_dir).mkdir(parents=True, exist_ok=True)
     Path(args.recon_dir).mkdir(parents=True, exist_ok=True)
     wb = maybe_init_wandb(args)
@@ -115,16 +156,21 @@ def main():
 
     # Model
     model = bmshj2018_factorized(quality=args.quality, pretrained=True)
-    model = replace_gdn_with_relu(model, mode=args.replace_parts)  # 置換
+    model = replace_gdn_with_relu(model, mode=args.replace_parts)
     model.to(args.device)
-    set_trainable_parts(model, replaced_block=args.replace_parts, train_scope=args.train_scope)  # 再学習範囲
+    set_trainable_parts(model, replaced_block=args.replace_parts, train_scope=args.train_scope)
 
-    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
-    use_amp = args.device.startswith("cuda")
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    # Optimizer
+    base_lr = args.lr
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=base_lr)
+
+    # AMP / Scaler
+    cuda_available = args.device.startswith("cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=cuda_available)
 
     best_msssim = 0.0
     start_epoch = 0
+    global_step = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(ckpt["model"], strict=False)
@@ -146,21 +192,50 @@ def main():
         avg_loss = 0.0
         for x in pbar:
             x = x.to(args.device)
+
+            # LR warmup: 線形
+            if args.lr_warmup_steps > 0:
+                factor = min(1.0, (global_step + 1) / float(args.lr_warmup_steps))
+            else:
+                factor = 1.0
+            _set_lr(opt, base_lr, factor)
+
+            # AMP warmup
+            amp_enabled = cuda_available and (global_step + 1 >= args.amp_warmup_steps)
+
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                x_hat = forward_reconstruction(model, x, clamp=False)
+
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                x_hat, raw_out = forward_reconstruction(model, x, clamp=False, return_all=True)
+                if do_overflow_check:
+                    _check_overflow(raw_out, tol=args.overflow_tol)
+
+            # 損失は常に FP32
             with torch.cuda.amp.autocast(enabled=False):
                 loss, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
+
             scaler.scale(loss).backward()
+
+            # 勾配クリッピング
+            if args.max_grad_norm and args.max_grad_norm > 0:
+                scaler.unscale_(opt)
+                clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.max_grad_norm)
+
             scaler.step(opt)
             scaler.update()
 
             avg_loss += float(loss.detach().cpu())
             cur_msssim = float(logs["ms_ssim"])
             cur_psnr   = psnr(x_hat.detach().clamp(0, 1), x).item()
-            pbar.set_postfix({"loss": f"{float(loss):.4f}", "msssim": f"{cur_msssim:.4f}", "psnr": f"{cur_psnr:.2f}"})
-            if wb:
-                wb.log({"train/loss": float(loss), "train/msssim": cur_msssim, "train/psnr": cur_psnr})
+            pbar.set_postfix({
+                "loss": f"{float(loss):.4f}",
+                "msssim": f"{cur_msssim:.4f}",
+                "psnr": f"{cur_psnr:.2f}",
+                "lr": f"{opt.param_groups[0]['lr']:.2e}",
+                "amp": int(amp_enabled),
+            })
+
+            global_step += 1
 
         avg_loss /= max(1, len(train_loader))
 
@@ -178,15 +253,7 @@ def main():
         mean_mss = sum(mss_list)/len(mss_list) if mss_list else 0.0
         mean_ps  = sum(psnr_list)/len(psnr_list) if psnr_list else 0.0
 
-        if wb:
-            wb.log({"val/ms_ssim": mean_mss, "val/psnr": mean_ps, "epoch": epoch+1})
         print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB  avg_loss={avg_loss:.4f}")
-
-        # 再構成保存
-        if recon_loader is not None and args.recon_every > 0 and ((epoch + 1) % args.recon_every == 0):
-            tag = f"e{epoch+1:03d}"
-            save_val_recons(model, recon_loader, args.device, args.recon_dir, tag, wb=wb,
-                            grid_max=min(16, args.recon_count))
 
         # Save
         ckpt = {
@@ -206,4 +273,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
