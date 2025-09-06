@@ -239,8 +239,8 @@ def main():
                     "train/loss": float(loss),
                     "train/msssim": cur_msssim,
                     "train/psnr": cur_psnr,
-                    "train/lr": opt.param_groups[0]["lr"],
-                    "train/amp_enabled": int(amp_enabled),
+                    "train_param/lr": opt.param_groups[0]["lr"],
+                    "train_param/amp_enabled": int(amp_enabled),
                 })
 
             global_step += 1
