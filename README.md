@@ -25,10 +25,7 @@ pip install -r requirements.txt
 COCO2017 をダウンロード済み（`train2017/` と `val2017/` が存在）なら、次で 224×224 クロップ済みデータを生成します。
 
 ```bash
-python -m scripts.coco_prepare \
-    --coco_dir /path/to/coco2017 \
-    --out_dir  /path/to/coco224 \
-    --include_val true
+python -m scripts.coco_prepare     --coco_dir /path/to/coco2017     --out_dir  /path/to/coco224     --include_val true
 ```
 
 ---
@@ -36,20 +33,7 @@ python -m scripts.coco_prepare \
 ## 3. 学習（ReLU 置換モデルのファインチューニング）
 
 ```bash
-python -m src.train_finetune_relu \
-    --coco_dir /path/to/coco224 \
-    --use_prepared true \
-    --quality 8 \
-    --epochs 10 \
-    --batch_size 16 \
-    --lr 1e-4 \
-    --alpha_l1 0.4 \
-    --replace_parts encoder \
-    --train_scope replaced \
-    --recon_every 2 \
-    --recon_count 16 \
-    --save_dir ./checkpoints \
-    --recon_dir ./recon
+python -m src.train_finetune_relu     --coco_dir /path/to/coco224     --use_prepared true     --quality 8     --epochs 10     --batch_size 16     --lr 1e-4     --alpha_l1 0.4     --replace_parts encoder     --train_scope replaced+hyper     --recon_every 2     --recon_count 16     --save_dir ./checkpoints     --recon_dir ./recon
 ```
 
 ### 主な引数
@@ -64,19 +48,28 @@ python -m src.train_finetune_relu \
 - `--recon_every`: 何エポックごとに再構成画像を保存するか。
 - `--recon_count`: 再構成に使う val サンプル枚数。
 
+#### 安定化用の追加引数
+- `--amp_warmup_steps`: AMP を無効にして FP32 で動かすステップ数（デフォルト: 100）。  
+  AMP はそれ以降に有効化。
+- `--lr_warmup_steps`: 学習率を線形にウォームアップするステップ数（デフォルト: 500）。
+- `--max_grad_norm`: 勾配クリッピングの閾値（既定: 1.0、0以下で無効）。  
+  モデル構造には影響しません。
+- `--overflow_check`: true の場合、forward 出力に NaN/Inf/過大値が出たら即停止。
+- `--overflow_tol`: 過大値検出の閾値（既定: 1e8）。
+
 ### 実装上の工夫
 - ReLU は **`inplace=False`** に設定し、勾配計算の安定性を確保。
-- 順伝播は AMP (半精度) を利用しつつ、損失計算は FP32 にキャストして NaN 発生を防止。
+- 順伝播は AMP (半精度) を利用しつつ、損失計算は FP32 にキャスト。
+- AMP ウォームアップと学習率ウォームアップで初期の不安定さを緩和。
+- 勾配クリッピングで発散を抑制。
+- forward 出力の NaN/Inf/過大値を即検知し、エラーで停止する仕組みを追加。
 
 ---
 
 ## 4. 評価
 
 ```bash
-python -m src.eval \
-    --coco_dir /path/to/coco224 \
-    --use_prepared true \
-    --checkpoint ./checkpoints/best_msssim.pt
+python -m src.eval     --coco_dir /path/to/coco224     --use_prepared true     --checkpoint ./checkpoints/best_msssim.pt
 ```
 
 出力: 平均 **PSNR** / **MS-SSIM**
@@ -90,6 +83,7 @@ python -m src.eval \
 - `set_trainable_parts(model, scope)` により学習対象を制御。  
   - 例: `--replace_parts decoder --train_scope replaced+hyper` → デコーダ置換＋hyperprior を学習。
 - 損失関数: `alpha * L1 + (1 - alpha) * (1 - MS-SSIM)`（既定 `alpha=0.4`）。
+- AMP + FP32 損失のハイブリッド計算で安定化。
 - 再構成画像は `recon/` に保存し、W&B にはグリッド形式でログ。
 
 ---
@@ -97,8 +91,13 @@ python -m src.eval \
 ## 6. 注意点 / Tips
 
 - ReLU 置換直後は不安定になりやすいので **学習率 1e-4 以下**を推奨。
-- `train_scope=replaced+hyper` にすると安定しやすいケースがあります。
-- NaN が発生した場合は AMP を無効化 (`torch.cuda.amp.autocast(enabled=False)`) して切り分け可能。
+- `train_scope=replaced+hyper` が最も安定しやすい。
+- NaN が発生した場合は  
+  - AMP ウォームアップを延長（例: `--amp_warmup_steps 1000`）  
+  - 学習率を下げる（例: `--lr 5e-5`）  
+  - 勾配クリッピングを強めにする（例: `--max_grad_norm 0.5`）  
+  などを調整してください。
+- オーバーフロー検知で止まった場合はログを確認し、encoder 出力の分布を可視化すると原因切り分けに役立ちます。
 
 ---
 
