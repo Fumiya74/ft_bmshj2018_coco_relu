@@ -100,6 +100,7 @@ python -m src.train_finetune_relu \
 - **再構成保存**
   - `--recon_every`: 何エポックごとに再構成画像を保存するか
   - `--recon_count`: 再構成に使う val サンプル枚数
+  - **更新**: `./recon/origin/NNNNN.png` に **元の val 画像**を一度だけ保存（番号で `./recon/<tag>/NNNNN.png` と 1:1 対応）
 
 > **変更点（重要）**  
 > - 旧オプション **`--amp_warmup_steps` は削除** しました。  
@@ -179,3 +180,97 @@ python -m scripts.export_onnx   --ckpt checkpoints/last.pt   --part decoder   --
 
 - 本レシピは研究・実験目的での利用を想定しています。  
 - 元モデル・コードは [CompressAI](https://github.com/InterDigitalInc/CompressAI) の `bmshj2018_factorized` を利用しています。
+
+---
+
+## 9. モデル構造（初学者向けやさしい解説）
+
+### 9.1 どんなモデル？
+`bmshj2018_factorized` は**学習ベース画像圧縮**モデルです。  
+画像 `x` を **エンコーダ**で低次元表現 `y`（潜在表現）に圧縮し、**量子化**→**エントロピー符号化**でビット列にします。  
+復元側は **エントロピー復号**→**デコーダ**で `x_hat` を再構成します。
+
+```
+x ──Encoder──> y ──Quantize──> ẏ ──EntropyCoder──> bitstream
+x_hat <──Decoder──  ẏ  <──EntropyDecoder<── bitstream
+```
+
+### 9.2 GDN と ReLU の違い
+- **GDN/IGDN**: 各チャネル同士の関係を正規化し、**歪みとレートの両立**に寄与（圧縮向けに設計された活性化）。  
+- **ReLU**: シンプルで高速・NPU 互換性も高いが、**分布の形**が変わり、レート（bpp）が悪化することがあります。  
+このため、**置換後に再学習**して性能を取り戻します。
+
+### 9.3 本リポジトリの工夫
+- `--replace_parts` で置換範囲を選択（エンコーダだけ、デコーダだけ、両方）。
+- `--train_scope` で**ハイパープライヤ（hyperprior）**や**エントロピー・ボトルネック**も一緒に再学習可能。  
+  置換による表現分布の変化を**確率モデル側**でも吸収させる狙いです。
+
+---
+
+## 10. 損失関数の分析方法（初学者向け）
+
+### 10.1 再構成損失
+- **L1**：平均絶対誤差（小さいほどよい）。  
+- **MS-SSIM**：人間の視覚に近い類似度（1 に近いほどよい）。  
+- 本レシピの**再構成損失**は `alpha * L1 + (1 - alpha) * (1 - MS-SSIM)`。  
+  - `alpha` が大きい → L1 を重視（細部や平均的な誤差）  
+  - `alpha` が小さい → MS-SSIM を重視（知覚的な見た目）
+
+### 10.2 RD 損失と bpp
+- **bpp (bits per pixel)**：1 画素あたりのビット数。小さいほど高圧縮。  
+- **RD 損失**：`loss = recon + λ * bpp`。`λ`（ランダウ係数）が大きいほど**圧縮率重視**になります。
+
+### 10.3 何をどう見ればいい？
+- 本スクリプトは **学習中に以下を標準出力と W&B に記録**します：
+  - `RD`（総合損失）, `L1`, `1-MSSSIM`, `BPP`, `λ`, `MSSSIM`, `PSNR`
+- **おすすめの見方**
+  1. `RD` が**下がっているか**（総合目標）  
+  2. `BPP` が**下がっているか**（圧縮率改善）  
+  3. `1-MSSSIM` / `L1` が**上がっていないか**（画質劣化していないか）  
+  4. `PSNR`, `MS-SSIM` が**維持 or 改善**しているか
+
+### 10.4 典型的なトレードオフ
+- `λ` を上げる → `BPP` は下がるが、`1-MSSSIM` や `L1` が上がりやすい（＝画質低下）。  
+- `α`（alpha_l1）を上げる → L1 を重視、テクスチャの**粒状感**が変化することあり。
+
+### 10.5 再構成画像と元画像の対応確認
+- `./recon/<tag>/NNNNN.png`（復元） と `./recon/origin/NNNNN.png`（元画像）は **番号で 1:1 対応**です。  
+  時系列で画質変化やアーティファクトの**視覚的比較**が簡単にできます。
+
+---
+
+## 11. 学習時の最適化手法（初学者向け）
+
+### 11.1 数値安定化の基本セット
+- **AMP を BF16 で使用**（`--amp true --amp_dtype bf16`）  
+- **損失は FP32** で計算（内部で自動切替）  
+- **局所FP32**：`--local_fp32 entropy+decoder` を推奨（確率モデルや Exp/Log 周りを FP32）  
+- **勾配クリップ**：`--max_grad_norm 1.0`（デフォルト）
+
+### 11.2 学習率スケジューリング
+- **CosineAnnealingLR**：シンプルで安定。`--sched cosine`  
+- **OneCycleLR**：立ち上がりが速い。`--sched onecycle --onecycle_pct_start 0.1`  
+- **ReduceLROnPlateau**：停滞時に LR を自動で下げる。`--sched plateau`
+
+### 11.3 つまずいた時の対処
+- 収束が遅い／発散する
+  - 学習率を 0.5〜0.2 倍に下げる（例 `1e-4 → 5e-5`）
+  - `--lr_warmup_steps` を増やす（例 `1000`）
+  - `--local_fp32 all_normexp` で FP32 範囲を広げる
+  - `--train_scope replaced+hyper` にして確率モデルも一緒に再学習
+- 画質は良いが bpp が高い
+  - `--lambda_bpp` を少し上げる（例 `0.015` → 圧縮率重視）
+- bpp は下がるが画質が悪い
+  - `--lambda_bpp` を少し下げる、または `alpha_l1` を下げて MS-SSIM 比重を上げる
+
+### 11.4 ログ活用（W&B）
+- 有効化: `--wandb true`（必要なら `WANDB_PROJECT` を環境変数で指定）  
+- 主なキー（学習中）  
+  - 再構成: `train/msssim`, `train/psnr`  
+  - RD 内訳: `train/rd/total`, `train/rd/recon_total`, `train/rd/l1`, `train/rd/1-msssim`, `train/rd/bpp`, `train/rd/lambda_bpp`  
+- 検証: `val/ms_ssim`, `val/psnr`  
+- 画像プレビュー: `recon/<tag>`（グリッド）
+
+---
+
+以上。初心者は **「3. 学習」→「10. 損失の見方」→「11. 最適化」** の順で触るのがおすすめです。
