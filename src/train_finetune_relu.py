@@ -1,7 +1,16 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Training script (bmshj2018_factorized with GDN→ReLU) with:
+- RD-loss detailed logging (tqdm + Weights & Biases) when --loss_type rd
+- Validation recon PNGs per epoch AND original validation images saved once to ./recon/origin
+  so you can always tell which originals correspond to reconstructions.
+Drop this file over your existing script and run as usual.
+"""
 
 import argparse, os
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -46,7 +55,7 @@ def get_args():
                     choices=["replaced","replaced+hyper","all"],
                     help="再学習範囲：置換ブロックのみ / 置換+hyperprior+entropy_bottleneck / 全層")
 
-    # AMP 設定（★ amp_warmup_steps は削除）
+    # AMP 設定
     ap.add_argument("--amp", type=str, default="true", help="true で AMP を有効化")
     ap.add_argument("--amp_dtype", type=str, choices=["fp16","bf16"], default="bf16")
 
@@ -109,26 +118,55 @@ def maybe_init_wandb(args):
         print(f"W&B 無効化: {e}")
         return None
 
+def _wb_log(wb, payload: dict):
+    """Safe W&B logging (ignores None values, handles wb=None)."""
+    if wb is None:
+        return
+    clean = {k: v for k, v in payload.items() if v is not None}
+    if clean:
+        wb.log(clean)
+
 @torch.no_grad()
 def save_val_recons(model, loader, device, save_root, tag, wb=None, grid_max=16):
+    """
+    Save reconstructed images under {save_root}/{tag}/NNNNN.png and
+    save the corresponding original validation images (once) under {save_root}/origin/NNNNN.png.
+    Indexing is consistent across tags: origin/00000.png corresponds to {tag}/00000.png.
+    """
     model.eval()
     out_dir = Path(save_root) / tag
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    origin_dir = Path(save_root) / "origin"
+    origin_dir.mkdir(parents=True, exist_ok=True)
+
     saved = 0
     grid_samples = []
     for x in loader:
         x = x.to(device)
+        # keep unclamped original tensor for saving origin
+        x_for_save = x.detach().cpu().clamp(0, 1)
         x_hat = forward_reconstruction(model, x, clamp=True)
+
         bs = x_hat.size(0)
         for b in range(bs):
-            save_image(x_hat[b], out_dir / f"{saved:05d}.png")
+            recon_path = out_dir / f"{saved:05d}.png"
+            save_image(x_hat[b], recon_path)
+
+            # Save origin once (if not existing); indexing stays consistent even if file already present
+            origin_path = origin_dir / f"{saved:05d}.png"
+            if not origin_path.exists():
+                save_image(x_for_save[b], origin_path)
+
             if len(grid_samples) < grid_max:
                 grid_samples.append(x_hat[b].cpu())
             saved += 1
+
     if wb and len(grid_samples) > 0:
         grid = vutils.make_grid(grid_samples, nrow=4, padding=2)
         wb.log({f"recon/{tag}": [wb.Image(grid, caption=tag)]})
     print(f"[recon] Saved {saved} recon images to {out_dir}")
+    print(f"[recon] Originals stored in {origin_dir} (saved once; existing files are reused)")
 
 def _iter_tensors(obj: Any):
     if torch.is_tensor(obj):
@@ -231,7 +269,7 @@ def main():
         best_msssim = ckpt.get("best_msssim", 0.0)
         print(f"Resumed from {args.resume} (next epoch = {start_epoch})")
 
-    # 事前の再構成保存
+    # 事前の再構成保存（origin も保存）
     if recon_loader is not None:
         tag = f"pre_e{start_epoch:03d}"
         save_val_recons(model, recon_loader, args.device, args.recon_dir, tag, wb=wb,
@@ -262,9 +300,29 @@ def main():
             with torch.cuda.amp.autocast(enabled=False):
                 if args.loss_type == "recon":
                     loss, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
+                    rd_components = {
+                        "l1": logs.get("l1", None),
+                        "one_minus_msssim": float(1.0 - float(logs.get("ms_ssim", 0.0))) if logs.get("ms_ssim", None) is not None else None,
+                        "recon_total": float(loss.detach().cpu()),
+                        "bpp": None,
+                        "lambda_bpp": None,
+                        "rd_total": None,
+                    }
+                    ms_ssim_cur = float(logs.get("ms_ssim", 0.0))
                 else:
                     likelihoods = extract_likelihoods(raw_out)
                     loss, logs = rd_loss(x_hat, x, likelihoods, alpha_l1=args.alpha_l1, lambda_bpp=args.lambda_bpp)
+                    # 再構成内訳（RDとは別に計算し直して表示用に使う）
+                    recon_only_loss, recon_logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
+                    rd_components = {
+                        "l1": float(recon_logs.get("l1", 0.0)),
+                        "one_minus_msssim": float(1.0 - float(recon_logs.get("ms_ssim", 0.0))) if recon_logs.get("ms_ssim", None) is not None else None,
+                        "recon_total": float(recon_only_loss.detach().cpu()),
+                        "bpp": float(logs.get("bpp", 0.0)) if logs.get("bpp", None) is not None else None,
+                        "lambda_bpp": float(args.lambda_bpp),
+                        "rd_total": float(loss.detach().cpu()),
+                    }
+                    ms_ssim_cur = float(recon_logs.get("ms_ssim", 0.0))
 
             scaler.scale(loss).backward()
 
@@ -280,26 +338,52 @@ def main():
             if args.sched == "onecycle":
                 sched.step()
 
-            avg_loss += float(loss.detach().cpu())
-            cur_msssim = float(logs.get("ms_ssim", 0.0))
-            cur_psnr   = psnr(x_hat.detach().clamp(0, 1), x).item()
-            pbar.set_postfix({
-                "loss": f"{float(loss):.4f}",
-                "msssim": f"{cur_msssim:.4f}",
-                "psnr": f"{cur_psnr:.2f}",
-                "lr": f"{opt.param_groups[0]['lr']:.2e}",
-                "amp": int(amp_enabled),
-            })
-            if wb:
-                wb.log({
-                    "train/loss": float(loss),
-                    "train/msssim": cur_msssim,
-                    "train/psnr": cur_psnr,
-                    "train_param/lr": opt.param_groups[0]["lr"],
-                    "train_param/amp_enabled": int(amp_enabled),
-                    "train/bpp": logs.get("bpp", None),
+            cur_psnr = psnr(x_hat.detach().clamp(0, 1), x).item()
+
+            # tqdm 表示：RD時は内訳も表示
+            if args.loss_type == "rd":
+                pbar.set_postfix({
+                    "RD": f"{rd_components['rd_total']:.4f}",
+                    "L1": f"{rd_components['l1']:.4f}" if rd_components['l1'] is not None else "n/a",
+                    "1-MSS": f"{rd_components['one_minus_msssim']:.4f}" if rd_components['one_minus_msssim'] is not None else "n/a",
+                    "BPP": f"{rd_components['bpp']:.4f}" if rd_components["bpp"] is not None else "n/a",
+                    "λ": f"{rd_components['lambda_bpp']:.3g}" if rd_components["lambda_bpp"] is not None else "n/a",
+                    "MSSSIM": f"{ms_ssim_cur:.4f}",
+                    "PSNR": f"{cur_psnr:.2f}",
+                    "lr": f"{opt.param_groups[0]['lr']:.2e}",
+                    "amp": int(amp_enabled),
+                })
+            else:
+                pbar.set_postfix({
+                    "loss": f"{float(loss):.4f}",
+                    "MSSSIM": f"{ms_ssim_cur:.4f}",
+                    "PSNR": f"{cur_psnr:.2f}",
+                    "lr": f"{opt.param_groups[0]['lr']:.2e}",
+                    "amp": int(amp_enabled),
                 })
 
+            # W&B ログ
+            _wb_log(wb, {
+                "train/psnr": cur_psnr,
+                "train/msssim": ms_ssim_cur,
+                "train_param/lr": opt.param_groups[0]["lr"],
+                "train_param/amp_enabled": int(amp_enabled),
+            })
+            if args.loss_type == "rd":
+                _wb_log(wb, {
+                    "train/rd/total": rd_components["rd_total"],
+                    "train/rd/recon_total": rd_components["recon_total"],
+                    "train/rd/l1": rd_components["l1"],
+                    "train/rd/1-msssim": rd_components["one_minus_msssim"],
+                    "train/rd/bpp": rd_components["bpp"],
+                    "train/rd/lambda_bpp": rd_components["lambda_bpp"],
+                })
+            else:
+                _wb_log(wb, {
+                    "train/loss": float(loss),
+                })
+
+            avg_loss += float(loss.detach().cpu())
             global_step += 1
 
         avg_loss /= max(1, len(train_loader))
@@ -319,12 +403,11 @@ def main():
         mean_ps  = sum(psnr_list)/len(psnr_list) if psnr_list else 0.0
 
         print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB  avg_loss={avg_loss:.4f}")
-        if wb:
-            wb.log({
-                "val/ms_ssim": mean_mss,
-                "val/psnr": mean_ps,
-                "epoch": epoch+1
-            })
+        _wb_log(wb, {
+            "val/ms_ssim": mean_mss,
+            "val/psnr": mean_ps,
+            "epoch": epoch+1
+        })
 
         # scheduler (epoch-wise)
         if args.sched in ["cosine"]:
@@ -333,12 +416,13 @@ def main():
             # 監視指標は MS-SSIM（大きいほど良い）
             sched.step(mean_mss)
 
-        # ★ 既定の間隔で、再構成画像を PNG 保存
+        # 既定の間隔で再構成画像を PNG 保存（origin は save_val_recons が必要に応じて一度だけ保存）
         if recon_loader is not None and args.recon_every > 0 and ((epoch + 1) % args.recon_every == 0):
             tag = f"e{epoch+1:03d}"
             save_val_recons(model, recon_loader, args.device, args.recon_dir, tag, wb=wb,
                             grid_max=min(16, args.recon_count))
-        # Save
+
+        # Save checkpoints
         ckpt = {
             "epoch": epoch,
             "model": model.state_dict(),
