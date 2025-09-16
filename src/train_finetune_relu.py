@@ -1,7 +1,7 @@
 
 import argparse, os
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Iterable, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -12,8 +12,14 @@ from tqdm import tqdm
 
 from compressai.zoo import bmshj2018_factorized
 from src.dataset_coco import ImageFolder224
-from src.losses import recon_loss, psnr
-from src.model_utils import replace_gdn_with_relu, set_trainable_parts, forward_reconstruction
+from src.losses import recon_loss, psnr, rd_loss
+from src.model_utils import (
+    replace_gdn_with_relu,
+    set_trainable_parts,
+    forward_reconstruction,
+    wrap_modules_for_local_fp32,
+    extract_likelihoods,
+)
 
 def get_args():
     ap = argparse.ArgumentParser()
@@ -40,17 +46,36 @@ def get_args():
                     choices=["replaced","replaced+hyper","all"],
                     help="再学習範囲：置換ブロックのみ / 置換+hyperprior+entropy_bottleneck / 全層")
 
-    # 安定化
-    ap.add_argument("--amp_warmup_steps", type=int, default=100,
-                    help="このステップ数までは AMP を無効化（FP32 で安定化）")
+    # AMP 設定（★ amp_warmup_steps は削除）
+    ap.add_argument("--amp", type=str, default="true", help="true で AMP を有効化")
+    ap.add_argument("--amp_dtype", type=str, choices=["fp16","bf16"], default="bf16")
+
+    # 局所FP32ポリシー
+    ap.add_argument("--local_fp32", type=str, default="none",
+                    choices=["none","entropy","entropy+decoder","all_normexp","custom"],
+                    help="特定モジュールを局所的にFP32で実行して数値安定化")
+    ap.add_argument("--local_fp32_custom", type=str, default="",
+                    help="custom の場合: カンマ区切りでクラス名の部分一致（例: 'EntropyBottleneck,Softmax'）")
+
+    # 学習率最適化（スケジューラ/オプティマイザ）
+    ap.add_argument("--optimizer", type=str, choices=["adam","adamw"], default="adam")
+    ap.add_argument("--weight_decay", type=float, default=0.0)
+    ap.add_argument("--sched", type=str, choices=["none","cosine","onecycle","plateau"], default="cosine")
     ap.add_argument("--lr_warmup_steps", type=int, default=500,
                     help="線形ウォームアップのステップ数（最大学習率に到達するまで）")
-    ap.add_argument("--max_grad_norm", type=float, default=1.0,
-                    help="勾配クリッピングのしきい値。0 以下で無効")
+    ap.add_argument("--onecycle_pct_start", type=float, default=0.1, help="OneCycleLRのpct_start")
+
+    # 安定化
+    ap.add_argument("--max_grad_norm", type=float, default=1.0, help="勾配クリッピングのしきい値。0 以下で無効")
     ap.add_argument("--overflow_check", type=str, default="true",
                     help="true のとき forward 出力に NaN/Inf/過大値があれば即停止")
     ap.add_argument("--overflow_tol", type=float, default=1e8,
                     help="過大値（abs>この値）検知で停止")
+
+    # 損失
+    ap.add_argument("--loss_type", type=str, choices=["recon","rd"], default="recon",
+                    help="'recon' は再構成誤差のみ、'rd' はレート歪み最適化")
+    ap.add_argument("--lambda_bpp", type=float, default=0.01, help="RD のレート項の係数（bpp に掛ける）")
 
     ap.add_argument("--resume", type=str, default="")
     ap.add_argument("--wandb", type=str, default="false", help="true で W&B を有効化")
@@ -129,6 +154,26 @@ def _set_lr(optimizer: torch.optim.Optimizer, base_lr: float, factor: float):
     for pg in optimizer.param_groups:
         pg["lr"] = base_lr * factor
 
+def _build_optimizer(args, params):
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    return torch.optim.Adam(params, lr=args.lr, weight_decay=args.weight_decay)
+
+def _build_scheduler(args, optimizer, steps_per_epoch: int):
+    sched = None
+    if args.sched == "cosine":
+        # CosineAnnealingLR: エポック単位で更新
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=max(1e-8, args.lr*0.01))
+    elif args.sched == "onecycle":
+        # ステップ単位で更新
+        total_steps = max(1, steps_per_epoch * args.epochs)
+        sched = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=args.lr, total_steps=total_steps, pct_start=args.onecycle_pct_start, anneal_strategy="cos"
+        )
+    elif args.sched == "plateau":
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=2, verbose=True)
+    return sched
+
 def main():
     args = get_args()
     use_prepared = args.use_prepared.lower() == "true"
@@ -157,16 +202,22 @@ def main():
     # Model
     model = bmshj2018_factorized(quality=args.quality, pretrained=True)
     model = replace_gdn_with_relu(model, mode=args.replace_parts)
+    wrap_modules_for_local_fp32(model, policy=args.local_fp32, custom=args.local_fp32_custom)
     model.to(args.device)
     set_trainable_parts(model, replaced_block=args.replace_parts, train_scope=args.train_scope)
 
-    # Optimizer
+    # Optimizer / Scheduler
     base_lr = args.lr
-    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=base_lr)
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = _build_optimizer(args, params)
+    steps_per_epoch = max(1, len(train_loader))
+    sched = _build_scheduler(args, opt, steps_per_epoch)
 
     # AMP / Scaler
     cuda_available = args.device.startswith("cuda")
-    scaler = torch.cuda.amp.GradScaler(enabled=cuda_available)
+    amp_enabled = cuda_available and (args.amp.lower() == "true")
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     best_msssim = 0.0
     start_epoch = 0
@@ -193,39 +244,44 @@ def main():
         for x in pbar:
             x = x.to(args.device)
 
-            # LR warmup: 線形
-            if args.lr_warmup_steps > 0:
+            # LR warmup (linear, batch-wise)
+            if args.lr_warmup_steps > 0 and (args.sched in ["none","cosine","plateau"]):
                 factor = min(1.0, (global_step + 1) / float(args.lr_warmup_steps))
             else:
                 factor = 1.0
             _set_lr(opt, base_lr, factor)
 
-            # AMP warmup
-            amp_enabled = cuda_available and (global_step + 1 >= args.amp_warmup_steps)
-
             opt.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
                 x_hat, raw_out = forward_reconstruction(model, x, clamp=False, return_all=True)
                 if do_overflow_check:
                     _check_overflow(raw_out, tol=args.overflow_tol)
 
-            # 損失は常に FP32
+            # 損失は必ず FP32
             with torch.cuda.amp.autocast(enabled=False):
-                loss, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
+                if args.loss_type == "recon":
+                    loss, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
+                else:
+                    likelihoods = extract_likelihoods(raw_out)
+                    loss, logs = rd_loss(x_hat, x, likelihoods, alpha_l1=args.alpha_l1, lambda_bpp=args.lambda_bpp)
 
             scaler.scale(loss).backward()
 
             # 勾配クリッピング
             if args.max_grad_norm and args.max_grad_norm > 0:
                 scaler.unscale_(opt)
-                clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.max_grad_norm)
+                clip_grad_norm_(params, args.max_grad_norm)
 
             scaler.step(opt)
             scaler.update()
 
+            # scheduler update
+            if args.sched == "onecycle":
+                sched.step()
+
             avg_loss += float(loss.detach().cpu())
-            cur_msssim = float(logs["ms_ssim"])
+            cur_msssim = float(logs.get("ms_ssim", 0.0))
             cur_psnr   = psnr(x_hat.detach().clamp(0, 1), x).item()
             pbar.set_postfix({
                 "loss": f"{float(loss):.4f}",
@@ -241,6 +297,7 @@ def main():
                     "train/psnr": cur_psnr,
                     "train_param/lr": opt.param_groups[0]["lr"],
                     "train_param/amp_enabled": int(amp_enabled),
+                    "train/bpp": logs.get("bpp", None),
                 })
 
             global_step += 1
@@ -268,8 +325,15 @@ def main():
                 "val/psnr": mean_ps,
                 "epoch": epoch+1
             })
-            
-        # ★ 既定の間隔で、再構成画像を PNG で保存（ディレクトリ分割）＋ W&B にグリッドをログ
+
+        # scheduler (epoch-wise)
+        if args.sched in ["cosine"]:
+            sched.step()
+        elif args.sched == "plateau":
+            # 監視指標は MS-SSIM（大きいほど良い）
+            sched.step(mean_mss)
+
+        # ★ 既定の間隔で、再構成画像を PNG 保存
         if recon_loader is not None and args.recon_every > 0 and ((epoch + 1) % args.recon_every == 0):
             tag = f"e{epoch+1:03d}"
             save_val_recons(model, recon_loader, args.device, args.recon_dir, tag, wb=wb,
