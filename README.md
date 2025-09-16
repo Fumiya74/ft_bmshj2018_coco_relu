@@ -35,33 +35,33 @@ python -m scripts.coco_prepare   --coco_dir /path/to/coco2017   --out_dir  /path
 ### 最小実行例（再構成損失のみ）
 ```bash
 python -m src.train_finetune_relu \
---coco_dir /path/to/coco224 \
---use_prepared true \
---quality 8 --epochs 10 --batch_size 16 \
---lr 1e-4 --alpha_l1 0.4 \
---replace_parts encoder --train_scope replaced+hyper  \
---recon_every 2 --recon_count 16 \
---save_dir ./checkpoints --recon_dir ./recon \
---amp true --amp_dtype bf16 \
---local_fp32 entropy \
---loss_type recon \
---sched cosine --optimizer adamw --weight_decay 1e-4
+  --coco_dir /path/to/coco224 \
+  --use_prepared true \
+  --quality 8 --epochs 10 --batch_size 16 \
+  --lr 1e-4 --alpha_l1 0.4 \
+  --replace_parts encoder --train_scope replaced+hyper  \
+  --recon_every 2 --recon_count 16 \
+  --save_dir ./checkpoints --recon_dir ./recon \
+  --amp true --amp_dtype bf16 \
+  --local_fp32 entropy \
+  --loss_type recon \
+  --sched cosine --optimizer adamw --weight_decay 1e-4
 ```
 
 ### RD 最適化（bpp も最小化）
 ```bash
 python -m src.train_finetune_relu \
---coco_dir /path/to/coco224 \
---use_prepared true \
---quality 8 --epochs 10 --batch_size 16 \
---lr 1e-4 --alpha_l1 0.4 \
---replace_parts encoder --train_scope replaced+hyper \
---recon_every 2 --recon_count 16 \
---save_dir ./checkpoints --recon_dir ./recon \
---amp true --amp_dtype bf16 \
---local_fp32 entropy+decoder \
---loss_type rd --lambda_bpp 0.01 \
---sched onecycle --onecycle_pct_start 0.1 --optimizer adam
+  --coco_dir /path/to/coco224 \
+  --use_prepared true \
+  --quality 8 --epochs 10 --batch_size 16 \
+  --lr 1e-4 --alpha_l1 0.4 \
+  --replace_parts encoder --train_scope replaced+hyper \
+  --recon_every 2 --recon_count 16 \
+  --save_dir ./checkpoints --recon_dir ./recon \
+  --amp true --amp_dtype bf16 \
+  --local_fp32 entropy+decoder \
+  --loss_type rd --lambda_bpp 0.01 \
+  --sched onecycle --onecycle_pct_start 0.1 --optimizer adam
 ```
 
 ### 主な引数（更新点含む）
