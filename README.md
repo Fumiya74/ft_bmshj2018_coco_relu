@@ -34,34 +34,12 @@ python -m scripts.coco_prepare   --coco_dir /path/to/coco2017   --out_dir  /path
 
 ### 最小実行例（再構成損失のみ）
 ```bash
-python -m src.train_finetune_relu \
-  --coco_dir /path/to/coco224 \
-  --use_prepared true \
-  --quality 8 --epochs 10 --batch_size 16 \
-  --lr 1e-4 --alpha_l1 0.4 \
-  --replace_parts encoder --train_scope replaced+hyper  \
-  --recon_every 2 --recon_count 16 \
-  --save_dir ./checkpoints --recon_dir ./recon \
-  --amp true --amp_dtype bf16 \
-  --local_fp32 entropy \
-  --loss_type recon \
-  --sched cosine --optimizer adamw --weight_decay 1e-4
+python -m src.train_finetune_relu   --coco_dir /path/to/coco224   --use_prepared true   --quality 8 --epochs 10 --batch_size 16   --lr 1e-4 --alpha_l1 0.4   --replace_parts encoder --train_scope replaced+hyper    --recon_every 2 --recon_count 16   --save_dir ./checkpoints --recon_dir ./recon   --amp true --amp_dtype bf16   --local_fp32 entropy   --loss_type recon   --sched cosine --optimizer adamw --weight_decay 1e-4
 ```
 
 ### RD 最適化（bpp も最小化）
 ```bash
-python -m src.train_finetune_relu \
-  --coco_dir /path/to/coco224 \
-  --use_prepared true \
-  --quality 8 --epochs 10 --batch_size 16 \
-  --lr 1e-4 --alpha_l1 0.4 \
-  --replace_parts encoder --train_scope replaced+hyper \
-  --recon_every 2 --recon_count 16 \
-  --save_dir ./checkpoints --recon_dir ./recon \
-  --amp true --amp_dtype bf16 \
-  --local_fp32 entropy+decoder \
-  --loss_type rd --lambda_bpp 0.01 \
-  --sched onecycle --onecycle_pct_start 0.1 --optimizer adam
+python -m src.train_finetune_relu   --coco_dir /path/to/coco224   --use_prepared true   --quality 8 --epochs 10 --batch_size 16   --lr 1e-4 --alpha_l1 0.4   --replace_parts encoder --train_scope replaced+hyper   --recon_every 2 --recon_count 16   --save_dir ./checkpoints --recon_dir ./recon   --amp true --amp_dtype bf16   --local_fp32 entropy+decoder   --loss_type rd --lambda_bpp 0.01   --sched onecycle --onecycle_pct_start 0.1 --optimizer adam
 ```
 
 ### 主な引数（更新点含む）
@@ -274,3 +252,45 @@ x_hat <──Decoder──  ẏ  <──EntropyDecoder<── bitstream
 ---
 
 以上。初心者は **「3. 学習」→「10. 損失の見方」→「11. 最適化」** の順で触るのがおすすめです。
+
+
+---
+
+# 追加: NPU 向け GDN/IGDN 置換（非線形・量子化フレンドリー）
+
+本レシピに **NPU フレンドリーな GDN/IGDN 置換ブロック**（ReLU6 / HardSigmoid / DepthwiseConv / ECA 等）を追加しました。  
+除算・平方根を避け、**量子化に強い**活性化のみで構成されています。
+
+## A. 同梱ファイル
+- `src/npu_blocks.py`
+  - **GDNishLiteEnc**（GDN代替）: `1x1 → ReLU6 → DW3×3 → ReLU6 → 1x1 → (ECA) [+ residual]`
+  - **GDNishLiteDec**（IGDN代替）: `1x1 → ReLU6 → per-channel 1x1 → HardSigmoid(スケール) → 乗算 → k×k [+ residual]`
+- `src/replace_gdn_npu.py`
+  - `replace_gdn_with_npu(model, mode='all', ...)`：CompressAI の **GDN/IGDN を自動検出して置換**。
+- `train_finetune_npu.py`
+  - 置換済みモデルを学習する**代替スクリプト**（CLI で t, kdw, ECA, ゲイン範囲を指定可能）。
+
+## B. 使い方（最短）
+1) 上記 3ファイルをプロジェクトの `src/`（`train_finetune_npu.py` は直下）に配置。  
+2) 実行:
+```bash
+python train_finetune_npu.py   --coco_dir /path/to/coco224   --quality 8 --epochs 10 --batch_size 16   --replace_parts all   --enc_t 2.0 --enc_kdw 3 --enc_eca true --enc_residual true   --dec_k 3 --dec_gmin 0.5 --dec_gmax 2.0 --dec_residual true   --loss_type rd --lambda_bpp 0.01
+```
+
+## C. 既存スクリプトからの呼び出し
+`src/train_finetune_relu.py` を使い続けたい場合は、モデル構築直後の
+```python
+from src.replace_gdn_npu import replace_gdn_with_npu
+model = replace_gdn_with_npu(model, mode=args.replace_parts)
+```
+に差し替えるだけでOKです。
+
+## D. 推奨ハイパラと量子化ノート
+- **Encoder(GDN)**: `t=2.0, kdw=3, ECA=on, residual=on`  
+- **Decoder(IGDN)**: `k=3, g_min=0.5, g_max=2.0, residual=on`  
+- **活性化**: ReLU6 / HardSigmoid（**量子化(QAT)に強い**分割線形）  
+- **QAT**: 可能なら FakeQuant を追加（per-channel weight / symmetric）。
+
+## E. ダウンロード
+- 置換ブロック/スクリプト一式の ZIP（`src/` + 学習スクリプト）はこちら:  
+  **[npu_gdn_replace_bundle.zip をダウンロード](sandbox:/mnt/data/npu_gdn_replace_bundle.zip)**
