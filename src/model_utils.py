@@ -62,7 +62,7 @@ def set_trainable_parts(model: nn.Module, replaced_block: str = "encoder", train
             p.requires_grad = True
         return
 
-    def _enable(module: nn.Module | None):
+    def _enable(module: Optional[nn.Module]):
         if module is None:
             return
         for p in module.parameters():
@@ -89,13 +89,10 @@ def _pick_x_hat(out, key_candidates: Sequence[str]) -> torch.Tensor:
         for k in key_candidates:
             if k in out:
                 return out[k]
-    # NamedTuple / Namespace-like (CompressAI のデフォルト)
-    if hasattr(out, "_fields"):  # namedtuple
-        # 標準の compressai forward は x_hat フィールドを持つ
+    if hasattr(out, "_fields"):
         for k in list(out._fields):
             if k in ("x_hat","x","recon","x_dec","x_out"):
                 return getattr(out, k)
-    # 最後の手段：属性探索
     for k in ("x_hat","x","recon","x_dec","x_out"):
         if hasattr(out, k):
             return getattr(out, k)
@@ -120,12 +117,57 @@ def forward_reconstruction(
     return (x_hat, out) if return_all else x_hat
 
 class _ForceFP32(nn.Module):
+    """
+    Wrap a submodule to run in FP32 even under AMP.
+    Also *casts inputs to float32* to avoid dtype mismatch inside the wrapped module,
+    then casts outputs back to the original input dtype (if it was floating).
+    """
     def __init__(self, module: nn.Module):
         super().__init__()
         self.module = module
+
+    def _to_fp32(self, obj):
+        if torch.is_tensor(obj):
+            return obj.float()
+        elif isinstance(obj, (list, tuple)):
+            t = type(obj)
+            return t(self._to_fp32(o) for o in obj)
+        elif isinstance(obj, dict):
+            return {k: self._to_fp32(v) for k, v in obj.items()}
+        return obj
+
+    def _cast_like(self, out, ref_dtype: torch.dtype):
+        if torch.is_tensor(out):
+            if out.is_floating_point():
+                return out.to(ref_dtype)
+            return out
+        elif isinstance(out, (list, tuple)):
+            t = type(out)
+            return t(self._cast_like(o, ref_dtype) for o in out)
+        elif isinstance(out, dict):
+            return {k: self._cast_like(v, ref_dtype) for k, v in out.items()}
+        return out
+
     def forward(self, *args, **kwargs):
+        # pick a reference floating dtype from inputs (bf16/fp16/fp32)
+        ref_dtype = None
+        def _find_ref(o):
+            nonlocal ref_dtype
+            if torch.is_tensor(o) and o.is_floating_point():
+                ref_dtype = ref_dtype or o.dtype
+        for a in args: _find_ref(a)
+        for v in kwargs.values(): _find_ref(v)
+
+        # upcast inputs to fp32
+        args32 = self._to_fp32(args)
+        kwargs32 = self._to_fp32(kwargs)
+
         with torch.cuda.amp.autocast(enabled=False):
-            out = self.module(*args, **kwargs)
+            out = self.module(*args32, **kwargs32)
+
+        # cast back to the reference dtype to keep graph consistent
+        if ref_dtype is not None and ref_dtype != torch.float32:
+            out = self._cast_like(out, ref_dtype)
         return out
 
 def _wrap_if_match(parent: nn.Module, name: str, child: nn.Module, match_names: List[str]) -> bool:
@@ -158,14 +200,13 @@ def wrap_modules_for_local_fp32(model: nn.Module, *, policy: str = "none", custo
     else:
         targets = []
 
-    # 再帰的に走査して置換
     def _recurse(mod: nn.Module):
         for name, child in list(mod.named_children()):
             replaced = _wrap_if_match(mod, name, child, targets)
             if not replaced:
                 _recurse(child)
     _recurse(model)
-    print(f"[local-fp32] policy='{policy}', custom='{custom}' applied.")
+    print(f"[local-fp32] policy='{policy}', custom='{custom}' applied (inputs force-cast to fp32).")
 
 def extract_likelihoods(raw_out: Any) -> Dict[str, torch.Tensor]:
     """
@@ -174,10 +215,8 @@ def extract_likelihoods(raw_out: Any) -> Dict[str, torch.Tensor]:
     if isinstance(raw_out, dict):
         if "likelihoods" in raw_out:
             return raw_out["likelihoods"]
-    # namedtuple など
     if hasattr(raw_out, "likelihoods"):
         return getattr(raw_out, "likelihoods")
-    # 最後の手段：キー探索
     if isinstance(raw_out, dict):
         for k in raw_out.keys():
             if "likelihood" in k:
