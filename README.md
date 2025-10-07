@@ -94,6 +94,52 @@ python -m src.train_finetune_relu   --coco_dir /path/to/coco224   --use_prepared
 - forward 出力の NaN/Inf/過大値を即検知し、エラーで停止
 
 ---
+## 3'. 学習（**NPU フレンドリー版**: `train_finetune_npu.py`）
+
+`GDN/IGDN` を **NPU で動かしやすい非線形ブロック**（`GDNishLiteEnc/Dec`）に置換して学習するスクリプトです。  
+量子化に強い **ReLU6 / HardSigmoid** と **Depthwise Conv** を用い、ONNX/NPU 互換性を重視しています。
+
+### 主な追加オプション
+- 置換対象: `--replace_parts {encoder,decoder,all}`（既定 `all`）
+- エンコーダブロック: `--enc_t 2.0`（1×1の拡張率）, `--enc_kdw 3`, `--enc_eca true/false`, `--enc_residual true/false`
+- デコーダブロック: `--dec_k 3`, `--dec_gmin 0.5`, `--dec_gmax 2.0`, `--dec_residual true/false`
+
+### 実行例（**エンコーダのみ**学習：`replaced+hyper`）
+```bash
+python train_finetune_npu.py \
+  --coco_dir /path/to/coco224 \
+  --use_prepared true \
+  --quality 8 --epochs 10 --batch_size 16 \
+  --lr 1e-4 --alpha_l1 0.4 \
+  --replace_parts encoder --train_scope replaced+hyper \
+  --enc_t 2.0 --enc_kdw 3 --enc_eca true --enc_residual true \
+  --dec_k 3 --dec_gmin 0.5 --dec_gmax 2.0 --dec_residual true \
+  --recon_every 2 --recon_count 16 \
+  --save_dir ./checkpoints_npu --recon_dir ./recon_npu \
+  --amp true --amp_dtype bf16 \
+  --local_fp32 entropy \
+  --loss_type rd --lambda_bpp 0.01 \
+  --sched cosine --optimizer adamw --weight_decay 1e-4
+```
+
+### 実行例（**全層**学習：`train_scope all`）
+```bash
+python train_finetune_npu.py \
+  --coco_dir /path/to/coco224 \
+  --use_prepared true \
+  --quality 8 --epochs 12 --batch_size 16 \
+  --lr 1e-4 --alpha_l1 0.4 \
+  --replace_parts all --train_scope all \
+  --enc_t 2.0 --enc_kdw 3 --enc_eca true --enc_residual true \
+  --dec_k 3 --dec_gmin 0.5 --dec_gmax 2.0 --dec_residual true \
+  --recon_every 2 --recon_count 16 \
+  --save_dir ./checkpoints_npu --recon_dir ./recon_npu \
+  --amp true --amp_dtype bf16 \
+  --local_fp32 entropy+decoder \
+  --loss_type rd --lambda_bpp 0.01 \
+  --sched onecycle --onecycle_pct_start 0.1 --optimizer adam
+```
+---
 
 ## 4. 評価
 
