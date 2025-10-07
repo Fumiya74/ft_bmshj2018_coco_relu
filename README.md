@@ -339,4 +339,149 @@ model = replace_gdn_with_npu(model, mode=args.replace_parts)
 
 ## E. ダウンロード
 - 置換ブロック/スクリプト一式の ZIP（`src/` + 学習スクリプト）はこちら:  
-  **[npu_gdn_replace_bundle.zip をダウンロード](sandbox:/mnt/data/npu_gdn_replace_bundle.zip)**
+  **[npu_gdn_replace_bundle.zip をダウンロード](sandbox:/mnt/data/npu_gdn_replace_bundle.zip)**  
+
+---
+
+---
+# GDNishLiteEnc / GDNishLiteDec モジュール仕様
+
+## 1. 背景と設計思想
+`GDNishLiteEnc` および `GDNishLiteDec` は、CompressAI における  
+**GDN (Generalized Divisive Normalization)** / **IGDN (Inverse GDN)** の代替として設計された  
+**NPU・ONNX フレンドリーな非線形活性ブロック**です。
+
+GDN/IGDN はチャネル間の相関をモデル化することで圧縮性能を高めますが、  
+浮動小数演算・除算・平方根などが多く、量子化やNPU上での展開に不向きです。  
+`GDNishLite*` はその特性を**近似的に再現しつつ、すべての演算をReLU系で構成**しています。
+
+---
+
+## 2. GDNishLiteEnc（Encoder側活性ブロック）
+
+### 構成概要
+```
+Input
+ └─> 1×1 Conv (expand: t×C)
+      └─> ReLU6
+          └─> Depthwise Conv (k_dw×k_dw)
+               └─> ReLU6
+                   └─> 1×1 Conv (reduce: C)
+                       └─> [ECA block (optional)]
+                           └─> Residual add (optional)
+Output
+```
+
+### 機能意図
+- **1×1 Conv + Depthwise Conv**  
+  → GDN が担う「チャネル相関＋局所正規化」を線形混合と空間フィルタで模倣。  
+- **ReLU6**  
+  → NPU 量子化に強く、範囲が固定 `[0,6]`。分布安定化に寄与。  
+- **ECA (Efficient Channel Attention)**  
+  → チャネル依存の適応ゲインを再現（除算でなく乗算ゲート）。  
+- **Residual**  
+  → 恒等写像近傍で初期化可能にし、学習初期の崩壊を防止。
+
+### 引数一覧
+| 引数名 | 型 / 既定値 | 説明 |
+|:-------|:-------------|:-----|
+| `channels` | int | 入力チャネル数 |
+| `t` | float = 2.0 | 1×1 Convでの拡張率。2.0で2倍チャネルへ一時展開 |
+| `k_dw` | int = 3 | Depthwise Convのカーネルサイズ（3 or 5 推奨） |
+| `use_eca` | bool = True | ECAブロックを挿入してチャネル依存ゲインを付与 |
+| `residual` | bool = True | 残差接続を有効化。既定True |
+| `eca_kernel` | int = 3 | ECA内部の1D畳み込みカーネル幅 |
+| `init_identity` | bool = True | 初期化時に恒等近傍重みで安定化 |
+| `act_type` | str = "relu6" | 活性化種別（`relu6` or `hardswish`） |
+| `bn` | bool = False | BatchNormを入れる場合（通常False、NPU親和） |
+
+### 推奨設定例
+- 通常学習：`t=2.0, k_dw=3, use_eca=True, residual=True`
+- 軽量化：`t=1.5, k_dw=3, use_eca=False`
+- 高精度：`t=2.5, k_dw=5, use_eca=True, residual=True`
+
+---
+
+## 3. GDNishLiteDec（Decoder側活性ブロック）
+
+### 構成概要
+```
+Input
+ └─> 1×1 Conv (C→C)
+      └─> ReLU6
+          └─> Per-channel 1×1 Conv (scale predictor)
+               └─> HardSigmoid → Clamp([g_min, g_max])
+                   └─> Multiply (ゲイン適用)
+                       └─> Depthwise Conv (k×k)
+                           └─> [Residual add]
+Output
+```
+
+### 機能意図
+- **HardSigmoid ゲート**  
+  → GDNの「√(β + Σγx²)」のような“ゲイン変調”を0〜1範囲で模倣。  
+- **g_min/g_maxスケーリング**  
+  → ゲインを `[g_min, g_max]` の範囲で再スケールし、1超の増幅も可能。  
+- **Depthwise Conv**  
+  → 局所的な復元を助ける平滑化を付加。  
+- **Residual**  
+  → 恒等出力を保持しつつ微分安定性を確保。
+
+### 引数一覧
+| 引数名 | 型 / 既定値 | 説明 |
+|:-------|:-------------|:-----|
+| `channels` | int | 入力チャネル数 |
+| `k` | int = 3 | Depthwise Convのカーネルサイズ |
+| `g_min` | float = 0.5 | HardSigmoid出力をスケーリングする下限 |
+| `g_max` | float = 2.0 | 同上 上限（>1で増幅も可能） |
+| `residual` | bool = True | 残差接続を有効化 |
+| `act_type` | str = "relu6" | 中間活性化種別（ReLU6またはHardSwish） |
+| `use_bn` | bool = False | BatchNorm使用可否（デフォルトFalse） |
+| `init_identity` | bool = True | 恒等近傍初期化 |
+
+### 推奨設定例
+- 標準構成：`k=3, g_min=0.5, g_max=2.0, residual=True`
+- 微細調整用：`g_min=0.7, g_max=1.5`（量子化時のダイナミックレンジを抑制）
+
+---
+
+## 4. 実装上のポイント
+- すべての活性関数は **ONNX / NPU 互換演算**（ReLU6, HardSigmoid, DepthwiseConv）で構成。  
+- **BatchNorm非依存設計**のため、INT8量子化でも分散揺れが少ない。  
+- `init_identity=True` 時は初期パラメータを恒等近傍にし、既存学習済み重みで置換しても出力分布を崩さない。  
+- ReLU6とHardSigmoidの組み合わせにより、**出力分布が安定かつ単調非減少**を保ち、GDN特有の非線形抑制特性を近似。
+
+---
+
+## 5. 推奨利用パターン
+| 用途 | 設定 | 備考 |
+|------|------|------|
+| 学習済みGDNを置換・再学習 | `replace_parts all`, `--enc_t 2.0`, `--dec_gmin 0.5 --dec_gmax 2.0` | 既存重み初期化＋fine-tune |
+| NPU向け軽量学習 | `--enc_t 1.5 --enc_eca false --dec_gmin 0.7 --dec_gmax 1.3` | 低消費電力優先 |
+| 高画質再構成検証 | `--enc_t 2.5 --enc_eca true --dec_gmin 0.4 --dec_gmax 2.5` | 学習時にRD損失を採用 |
+
+---
+
+## 6. 学習時の安定化Tips
+- `bf16` AMP 推奨（除算を含まないため誤差耐性が高い）  
+- `--local_fp32 entropy+decoder` で確率モデル周りをFP32化  
+- ReLU6により勾配爆発を防ぎつつ、HardSigmoid出力を`[g_min,g_max]`で制御  
+- QATを行う場合は`FakeQuantObserver`をConv前後に挿入可
+
+---
+
+## 7. ONNX / NPU 特性
+| 要素 | 対応 | 備考 |
+|------|------|------|
+| ReLU6 / HardSigmoid | ✅ | ONNX opset ≥ 13 対応 |
+| Depthwise Conv | ✅ | Group = channels 指定 |
+| ECA (1D Conv) | ✅ | Flatten → Conv1D で展開可 |
+| Residual Add | ✅ | ElementwiseAdd |
+| BatchNorm | ⛔ (非推奨) | 量子化変換時に非線形範囲が拡大するため |
+
+---
+
+## 8. 参考
+- Ballé et al., *"End-to-end Optimized Image Compression"*, ICLR 2017  
+- Ma et al., *"ECA-Net: Efficient Channel Attention"*, CVPR 2020  
+- Han et al., *"Hard-Swish and Quantization-friendly Activations"*, Google AI, 2019
