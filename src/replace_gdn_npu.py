@@ -1,14 +1,13 @@
 
 import torch
 import torch.nn as nn
-from typing import Tuple
+from typing import Optional
 
 try:
     from compressai.layers import GDN
 except Exception:
     GDN = None
 
-# Import the proposed NPU-friendly blocks (must exist in your repo)
 from src.npu_blocks import GDNishLiteEnc, GDNishLiteDec
 
 
@@ -19,25 +18,16 @@ def _is_gdn(m: nn.Module) -> bool:
     return "gdn" in name or "generalizeddivisivenorm" in name
 
 
-def _infer_channels_from_gdn(gdn: nn.Module) -> int | None:
-    """
-    Try multiple strategies to infer the channel count from a GDN-like module.
-    Works with compressai.layers.GDN and lookalikes.
-    """
-    # official compressai GDN attribute
+def _infer_channels_from_gdn(gdn: nn.Module) -> Optional[int]:
     ch = getattr(gdn, "channels", None)
     if isinstance(ch, int) and ch > 0:
         return ch
-
-    # beta/gamma parameters
     beta = getattr(gdn, "beta", None)
     if isinstance(beta, torch.nn.Parameter) and beta.ndim == 1:
         return int(beta.numel())
-
     gamma = getattr(gdn, "gamma", None)
     if isinstance(gamma, torch.nn.Parameter) and gamma.ndim >= 1:
         return int(gamma.shape[0])
-
     return None
 
 
@@ -47,7 +37,6 @@ def _build_replacement(gdn: nn.Module, side_hint: str,
     channels = _infer_channels_from_gdn(gdn)
     if channels is None:
         raise ValueError("Cannot infer channel count for GDN module; please pass standard CompressAI modules.")
-
     if inverse or side_hint == "decoder":
         return GDNishLiteDec(channels=channels, **dec_kwargs)
     else:
@@ -70,19 +59,36 @@ def _replace_in(module: nn.Module, side_hint: str,
 def replace_gdn_with_npu(model: nn.Module,
                          mode: str = "all",
                          *,
+                         # Encoder knobs
                          enc_t: float = 2.0,
                          enc_kdw: int = 3,
                          enc_eca: bool = True,
                          enc_residual: bool = True,
                          enc_act: str = "relu6",
                          enc_bn: bool = False,
+                         # Decoder knobs
                          dec_k: int = 3,
                          dec_gmin: float = 0.5,
                          dec_gmax: float = 2.0,
                          dec_residual: bool = True,
                          dec_act: str = "relu6",
                          dec_bn: bool = False,
-                         verbose: bool = True) -> nn.Module:
+                         # Aliases for compatibility with older scripts
+                         enc_use_eca: Optional[bool] = None,
+                         verbose: bool = True,
+                         **extra_kwargs) -> nn.Module:
+    """
+    Replace GDN/IGDN with NPU-friendly blocks.
+    Accepts alias args like enc_use_eca for backward compatibility.
+    Extra unknown kwargs are ignored (with a warning).
+    """
+    if extra_kwargs and verbose:
+        print(f"[replace_gdn_with_npu] Ignoring extra kwargs: {list(extra_kwargs.keys())}")
+
+    # alias handling
+    if enc_use_eca is not None:
+        enc_eca = bool(enc_use_eca)
+
     mode = mode.lower()
     assert mode in {"all", "encoder", "decoder"}
 
