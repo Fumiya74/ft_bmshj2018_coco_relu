@@ -5,19 +5,16 @@ Unified training script for bmshj2018_factorized (CompressAI) with GDN replaceme
 - --act relu   : replace GDN/IGDN with ReLU
 - --act gdnish : replace GDN/IGDN with NPU-friendly GDNishLiteEnc/Dec blocks
 - Optional QAT (fake-quant) with automatic exclusion of EntropyBottleneck/Hyperprior vicinity
+  *and* scope selection: --qat_scope {encoder,decoder,all}
 - Optional EntropyBottleneck auxiliary loss optimizer (--eb_aux / --eb_aux_lr)
 - Validation recon PNGs per epoch AND original validation images saved once to ./recon/origin
-
-This is a drop-in replacement for previous train_* scripts.
 """
-
 import argparse, os
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torch.nn.utils import clip_grad_norm_
 import torchvision.utils as vutils
@@ -35,7 +32,7 @@ from src.model_utils import (
     extract_likelihoods,
 )
 
-# ---------- NPU-friendly blocks (GDNishLite) ----------
+# GDNish blocks (same as before)
 class ECA(nn.Module):
     def __init__(self, C: int, k: int = 3):
         super().__init__(); assert k % 2 == 1
@@ -172,16 +169,16 @@ def replace_gdn_with_gdnish(model: nn.Module, mode: str, enc_t: float, enc_kdw: 
     print(f"[replace_gdn_with_gdnish] Replaced {total} GDN/IGDN(s) with GDNishLite (mode='{mode}')")
     return model, total
 
-# ---------- EB aux helpers ----------
-def _collect_eb_aux_params(model: nn.Module) -> List[nn.Parameter]:
-    params: List[nn.Parameter] = []
+# EB aux helpers
+def _collect_eb_aux_params(model: nn.Module):
+    params = []
     for m in model.modules():
         if hasattr(m, "entropy_bottleneck"):
             params += list(m.entropy_bottleneck.parameters())
     return params
 
-def _compute_eb_aux_loss(model: nn.Module) -> torch.Tensor:
-    loss = torch.tensor(0.0, dtype=torch.float32)
+def _compute_eb_aux_loss(model: nn.Module):
+    loss = 0.0
     for m in model.modules():
         if hasattr(m, "entropy_bottleneck"):
             eb = m.entropy_bottleneck
@@ -189,115 +186,11 @@ def _compute_eb_aux_loss(model: nn.Module) -> torch.Tensor:
                 loss = loss + eb.loss()
     return loss
 
-# ---------- Lightweight QAT (FakeQuant) with automatic exclusion ----------
-class _EMAObserver:
-    def __init__(self, momentum: float = 0.95):
-        self.momentum = momentum
-        self.min = None
-        self.max = None
-        self.enabled = True
-    def update(self, x: torch.Tensor):
-        x_det = x.detach()
-        cur_min = x_det.amin()
-        cur_max = x_det.amax()
-        if self.min is None:
-            self.min = cur_min
-            self.max = cur_max
-        else:
-            self.min = self.min * self.momentum + cur_min * (1 - self.momentum)
-            self.max = self.max * self.momentum + cur_max * (1 - self.momentum)
-
-def _fake_quant_asym(x: torch.Tensor, obs: _EMAObserver, levels: int = 255):
-    min_v = obs.min if obs.min is not None else x.detach().amin()
-    max_v = obs.max if obs.max is not None else x.detach().amax()
-    if (max_v - min_v) < 1e-8:
-        return x
-    scale = (max_v - min_v) / levels
-    zp = torch.clamp(torch.round(-min_v / scale), 0, levels).to(x.device)
-    q = torch.clamp(torch.round(x / scale + zp), 0, levels)
-    return (q - zp) * scale
-
-def _fake_quant_sym_perchannel_w(w: torch.Tensor, dim: int = 0, levels: int = 127):
-    max_abs = w.detach().abs().amax(dim=tuple([i for i in range(w.dim()) if i != dim]), keepdim=True)
-    scale = torch.where(max_abs > 0, max_abs / levels, torch.ones_like(max_abs))
-    q = torch.round(w / scale)
-    q = torch.clamp(q, -levels, levels)
-    return q * scale
-
-class QConv2d(nn.Conv2d):
-    def __init__(self, base: nn.Conv2d, act_observer: _EMAObserver, qat_state: dict):
-        super().__init__(base.in_channels, base.out_channels, base.kernel_size, base.stride,
-                         base.padding, base.dilation, base.groups, base.bias is not None, base.padding_mode, device=base.weight.device, dtype=base.weight.dtype)
-        self.weight = nn.Parameter(base.weight.detach().clone())
-        if base.bias is not None:
-            self.bias = nn.Parameter(base.bias.detach().clone())
-        self.register_buffer("_qat_enabled", torch.tensor(1, dtype=torch.int32))
-        self.act_obs = act_observer
-        self.qat_state = qat_state
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        wq = _fake_quant_sym_perchannel_w(self.weight) if self._qat_enabled.item() == 1 else self.weight
-        y = F.conv2d(x, wq, self.bias, self.stride, self.padding, self.dilation, self.groups)
-        if self._qat_enabled.item() == 1:
-            if self.qat_state.get("obs_enabled", True):
-                self.act_obs.update(y)
-            y = _fake_quant_asym(y, self.act_obs)
-        return y
-
-class QAct(nn.Module):
-    def __init__(self, base_act: nn.Module, act_observer: _EMAObserver, qat_state: dict):
-        super().__init__()
-        self.base = base_act
-        self.obs = act_observer
-        self.qat_state = qat_state
-        self.register_buffer("_qat_enabled", torch.tensor(1, dtype=torch.int32))
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.base(x)
-        if self._qat_enabled.item() == 1:
-            if self.qat_state.get("obs_enabled", True):
-                self.obs.update(y)
-            y = _fake_quant_asym(y, self.obs)
-        return y
-
-def _should_exclude_by_name(mod_path: str) -> bool:
-    s = mod_path.lower()
-    keys = ["entropy_bottleneck", "gaussianconditional", "gaussian_conditional", ".h_a", ".h_s", "hyper", "entropy"]
-    return any(k in s for k in keys)
-
-def enable_qat_lightweight(model: nn.Module, *, exclude_entropy: bool, calib_steps: int, freeze_after: int):
-    qat_state = {"step": 0, "obs_enabled": True, "calib_steps": int(calib_steps), "freeze_after": int(freeze_after)}
-
-    def _wrap(module: nn.Module, prefix: str = ""):
-        for name, child in list(module.named_children()):
-            path = f"{prefix}.{name}" if prefix else name
-            if exclude_entropy and _should_exclude_by_name(path):
-                _wrap(child, path); continue
-            if isinstance(child, nn.Conv2d):
-                act_obs = _EMAObserver()
-                new = QConv2d(child, act_obs, qat_state)
-                setattr(module, name, new)
-            elif isinstance(child, (nn.ReLU, nn.ReLU6, nn.Hardswish)):
-                act_obs = _EMAObserver()
-                new = QAct(child, act_obs, qat_state)
-                setattr(module, name, new)
-            else:
-                _wrap(child, path)
-
-    _wrap(model)
-
-    class QATHandle:
-        def step(self, n: int = 1):
-            qat_state["step"] += n
-            if qat_state["step"] >= qat_state["calib_steps"]:
-                qat_state["obs_enabled"] = False
-        def enable(self):
-            for m in model.modules():
-                if hasattr(m, "_qat_enabled"): m._qat_enabled[...] = 1
-        def disable(self):
-            for m in model.modules():
-                if hasattr(m, "_qat_enabled"): m._qat_enabled[...] = 0
-
-    return QATHandle()
+# QAT: import new scoped helpers
+from src.qat_utils import (
+    prepare_qat_inplace_scoped,
+    step_qat_schedule,
+)
 
 def get_args():
     ap = argparse.ArgumentParser()
@@ -350,7 +243,10 @@ def get_args():
     ap.add_argument("--eb_aux", type=str, default="true")
     ap.add_argument("--eb_aux_lr", type=float, default=1e-3)
 
+    # QAT options (+ scope selection)
     ap.add_argument("--qat", type=str, default="false")
+    ap.add_argument("--qat_scope", type=str, choices=["encoder","decoder","all"], default="all",
+                    help="Where to insert FakeQuant: encoder(g_a), decoder(g_s), or all.")
     ap.add_argument("--qat_exclude_entropy", type=str, default="true")
     ap.add_argument("--qat_calib_steps", type=int, default=2000)
     ap.add_argument("--qat_freeze_after", type=int, default=8000)
@@ -489,28 +385,38 @@ def main():
     steps_per_epoch = max(1, len(train_loader))
     sched = _build_scheduler(args, opt, steps_per_epoch)
 
+    # EB aux optimizer (optional)
     use_eb_aux = args.eb_aux.lower() == "true"
     aux_opt = None
     if use_eb_aux:
-        aux_params = _collect_eb_aux_params(model)
-        if len(aux_params) == 0:
+        eb_params = []
+        for m in model.modules():
+            if hasattr(m, "entropy_bottleneck"):
+                eb_params += list(m.entropy_bottleneck.parameters())
+        if len(eb_params) == 0:
             print("[warn] No EntropyBottleneck params found for aux optimizer. --eb_aux will be ignored.")
             use_eb_aux = False
         else:
-            aux_opt = torch.optim.Adam(aux_params, lr=args.eb_aux_lr)
+            aux_opt = torch.optim.Adam(eb_params, lr=args.eb_aux_lr)
 
+    # QAT (optional + scope)
     use_qat = args.qat.lower() == "true"
-    qat_handle = None
     if use_qat:
-        qat_handle = enable_qat_lightweight(
+        from src.qat_utils import prepare_qat_inplace_scoped
+        prepare_qat_inplace_scoped(
             model,
+            scope=args.qat_scope,
+            encoder_attr="g_a",
+            decoder_attr="g_s",
             exclude_entropy=(args.qat_exclude_entropy.lower() == "true"),
             calib_steps=args.qat_calib_steps,
             freeze_after=args.qat_freeze_after,
+            verbose=True,
         )
-        qat_handle.enable()
-        print(f"[QAT] enabled (exclude_entropy={args.qat_exclude_entropy}, calib_steps={args.qat_calib_steps}, freeze_after={args.qat_freeze_after})")
+        print(f"[QAT] enabled scope={args.qat_scope} exclude_entropy={args.qat_exclude_entropy} "
+              f"calib_steps={args.qat_calib_steps} freeze_after={args.qat_freeze_after}")
 
+    # AMP / Scaler
     cuda_available = args.device.startswith("cuda")
     amp_enabled = cuda_available and (args.amp.lower() == "true")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
@@ -522,10 +428,14 @@ def main():
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(ckpt["model"], strict=False)
-        if "opt" in ckpt: opt.load_state_dict(ckpt["opt"])
+        if "opt" in ckpt:
+            opt.load_state_dict(ckpt["opt"])
         if "aux_opt" in ckpt and aux_opt is not None:
-            try: aux_opt.load_state_dict(ckpt["aux_opt"]); print("[resume] Restored aux optimizer state.")
-            except Exception as e: print(f"[resume] Skip restoring aux_opt: {e}")
+            try:
+                aux_opt.load_state_dict(ckpt["aux_opt"])
+                print("[resume] Restored aux optimizer state.")
+            except Exception as e:
+                print(f"[resume] Skip restoring aux_opt: {e}")
         start_epoch = ckpt.get("epoch", 0) + 1
         best_msssim = ckpt.get("best_msssim", 0.0)
         print(f"Resumed from {args.resume} (next epoch = {start_epoch})")
@@ -583,6 +493,12 @@ def main():
             if args.sched == "onecycle": sched.step()
 
             cur_psnr = psnr(x_hat.detach().clamp(0, 1), x).item()
+
+            # QAT observer scheduling
+            if args.qat.lower() == "true":
+                from src.qat_utils import step_qat_schedule
+                step_qat_schedule(model, global_step)
+
             if args.loss_type == "rd":
                 pbar.set_postfix({
                     "RD": f"{rd_components['rd_total']:.4f}",
@@ -599,33 +515,38 @@ def main():
                     "lr": f"{opt.param_groups[0]['lr']:.2e}", "amp": int(amp_enabled),
                 })
 
-            _wb_log(wb, {
-                "train/psnr": cur_psnr, "train/msssim": ms_ssim_cur,
-                "train_param/lr": opt.param_groups[0]["lr"], "train_param/amp_enabled": int(amp_enabled),
-            })
-            if args.loss_type == "rd":
-                _wb_log(wb, {
-                    "train/rd/total": rd_components["rd_total"],
-                    "train/rd/recon_total": rd_components["recon_total"],
-                    "train/rd/l1": rd_components["l1"],
-                    "train/rd/1-msssim": rd_components["one_minus_msssim"],
-                    "train/rd/bpp": rd_components["bpp"],
-                    "train/rd/lambda_bpp": rd_components["lambda_bpp"],
+            if wb is not None:
+                wb.log({
+                    "train/psnr": cur_psnr, "train/msssim": ms_ssim_cur,
+                    "train_param/lr": opt.param_groups[0]["lr"], "train_param/amp_enabled": int(amp_enabled),
                 })
-            else:
-                _wb_log(wb, {"train/loss": float(loss)})
+                if args.loss_type == "rd":
+                    wb.log({
+                        "train/rd/total": rd_components["rd_total"],
+                        "train/rd/recon_total": rd_components["recon_total"],
+                        "train/rd/l1": rd_components["l1"],
+                        "train/rd/1-msssim": rd_components["one_minus_msssim"],
+                        "train/rd/bpp": rd_components["bpp"],
+                        "train/rd/lambda_bpp": rd_components["lambda_bpp"],
+                    })
+                else:
+                    wb.log({"train/loss": float(loss)})
 
             avg_loss += float(loss.detach().cpu()); global_step += 1
-            if use_qat and qat_handle is not None:
-                qat_handle.step(1)
 
             if use_eb_aux and aux_opt is not None:
                 aux_opt.zero_grad(set_to_none=True)
                 with torch.cuda.amp.autocast(enabled=False):
-                    aux_loss = _compute_eb_aux_loss(model)
+                    aux_loss = 0.0
+                    for m in model.modules():
+                        if hasattr(m, "entropy_bottleneck"):
+                            eb = m.entropy_bottleneck
+                            if hasattr(eb, "loss"):
+                                aux_loss = aux_loss + eb.loss()
                 aux_loss.backward()
                 aux_opt.step()
-                _wb_log(wb, {"train/aux_loss": float(aux_loss)})
+                if wb is not None:
+                    wb.log({"train/aux_loss": float(aux_loss)})
 
         avg_loss /= max(1, len(train_loader))
 
@@ -641,7 +562,8 @@ def main():
         mean_mss = sum(mss_list)/len(mss_list) if mss_list else 0.0
         mean_ps  = sum(psnr_list)/len(psnr_list) if psnr_list else 0.0
         print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB  avg_loss={avg_loss:.4f}")
-        _wb_log(wb, {"val/ms_ssim": mean_mss, "val/psnr": mean_ps, "epoch": epoch+1})
+        if wb is not None:
+            wb.log({"val/ms_ssim": mean_mss, "val/psnr": mean_ps, "epoch": epoch+1})
 
         if args.sched in ["cosine"]:
             sched.step()

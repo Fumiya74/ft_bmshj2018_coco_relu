@@ -183,6 +183,57 @@ python -m src.train \
 - 勾配クリッピング、forward 出力の NaN/Inf/過大値チェック
 
 ---
+## 3'. 軽量 QAT（FakeQuant のみ / AMP 非推奨）
+
+**目的**：量子化耐性の改善（学習時に Q/DQ の影響を模擬）  
+**実装**：`src/qat_utils.py` の FakeQuant ラッパを Conv/Linear に in-place で挿入。
+
+### 使い方（例：ReLU + RD 学習 + QAT）
+```bash
+# encoderのみQATしながら全層学習
+python -m src.train \
+  --act relu \
+  --replace_parts encoder --train_scope all\
+  --qat true --qat_scope encoder --qat_exclude_entropy true \
+  --qat_calib_steps 2000 --qat_freeze_after 8000 \
+  --coco_dir /path/to/coco224 --use_prepared true \
+  --quality 8 --epochs 10 --batch_size 16 \
+  --lr 1e-4 --alpha_l1 0.4 \
+  --loss_type rd --lambda_bpp 0.01 \
+  --sched cosine --optimizer adamw --weight_decay 1e-4
+```
+
+### 使い方（例：GDNishLite + RD 学習 + QAT）
+```bash
+python -m src.train \
+  --coco_dir /path/to/coco224 \
+  --use_prepared true \
+  --quality 8 --epochs 10 --batch_size 16 \
+  --lr 1e-4 --alpha_l1 0.4 \
+  --act gdnishlite --replace_parts all --train_scope replaced+hyper \
+  --enc_t 2.0 --enc_kdw 3 --enc_eca true --enc_residual true \
+  --dec_k 3 --dec_gmin 0.5 --dec_gmax 2.0 --dec_residual true \
+  --loss_type rd --lambda_bpp 0.01 \
+  --qat true --qat_act_observer ema --qat_w_per_channel true \
+  --qat_disable_observer_step 5000 --qat_eval_fakequant true \
+  --amp false \
+  --recon_every 2 --recon_count 16 \
+  --save_dir ./checkpoints_qat --recon_dir ./recon_qat \
+  --local_fp32 entropy+decoder --sched cosine --optimizer adamw --weight_decay 1e-4
+```
+
+### QAT オプション
+- `--qat {true,false}`：軽量QATの有効化（既定 false）
+- `--qat_exclude_entropy {true,false}`: EntropyBottleneck / Hyperprior 近傍を自動除外（既定 true）
+- `--qat_act_observer {ema,minmax}`：活性観測（推奨 `ema`）
+- `--qat_calib_steps INT`: 観測器のレンジ学習（EMA）期間（既定 2000）
+- `--qat_freeze_after INT`: 以降は観測器を凍結（既定 8000）
+- `--qat_w_per_channel {true,false}`：Conv/Linear の重みを per-channel 量子化（推奨 true）
+- `--qat_disable_observer_step <int>`：指定 step 以降 observer を無効化して scale を固定（<0 で無効）
+- `--qat_eval_fakequant {true,false}`：検証時も FakeQuant を有効化（推奨 true）
+- **注意**：QAT 有効時は **AMP を自動的に無効化**（観測器と AMP の同時使用は非推奨）
+
+---
 
 ## 4. 評価
 
