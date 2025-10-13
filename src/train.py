@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Training script (bmshj2018_factorized with GDN→ReLU) with:
-- RD-loss detailed logging (tqdm + Weights & Biases) when --loss_type rd
-- Validation recon PNGs per epoch AND original validation images saved once to ./recon/origin
-  so you can always tell which originals correspond to reconstructions.
-- (NEW) EntropyBottleneck auxiliary loss optimizer (--eb_aux / --eb_aux_lr)
-Drop this file over your existing script and run as usual.
+Unified training script for bmshj2018_factorized with activation replacement:
+- --act relu         : replace GDN/IGDN -> ReLU
+- --act gdnishlite   : replace GDN/IGDN -> NPU-friendly GDNishLiteEnc/Dec
+Extras:
+- RD-loss logging, recon PNG dumping with origin cache
+- Optional EntropyBottleneck aux optimizer (--eb_aux / --eb_aux_lr)
+- (NEW) Lightweight QAT (--qat ...) using FakeQuant wrappers (no FX graph convert)
 """
 
 import argparse, os
@@ -30,17 +31,35 @@ from src.model_utils import (
     wrap_modules_for_local_fp32,
     extract_likelihoods,
 )
+from src.replace_gdn_npu import replace_gdn_with_npu
+from src.qat_utils import (
+    prepare_qat_inplace,
+    set_qat_observers_enabled,
+    set_qat_fakequant_enabled,
+)
 
 # ========= EB aux helpers =========
 def _collect_eb_aux_params(model):
     params = []
+    # top-level model may have .entropy_bottleneck (bmshj has at root)
+    if hasattr(model, "entropy_bottleneck"):
+        params += list(model.entropy_bottleneck.parameters())
+    # also check submodules to be safe
     for m in model.modules():
         if hasattr(m, "entropy_bottleneck"):
-            params += list(m.entropy_bottleneck.parameters())
-    return params
+            params += [p for p in m.entropy_bottleneck.parameters()]
+    # deduplicate by id
+    seen=set(); uniq=[]
+    for p in params:
+        if id(p) not in seen:
+            uniq.append(p); seen.add(id(p))
+    return uniq
 
 def _compute_eb_aux_loss(model):
     loss = 0.0
+    # bmshj2018_factorized exposes eb.loss()
+    if hasattr(model, "entropy_bottleneck") and hasattr(model.entropy_bottleneck, "loss"):
+        loss = loss + model.entropy_bottleneck.loss()
     for m in model.modules():
         if hasattr(m, "entropy_bottleneck"):
             eb = m.entropy_bottleneck
@@ -66,12 +85,24 @@ def get_args():
     ap.add_argument("--recon_count", type=int, default=16)
 
     # 置換対象と再学習スコープ
+    ap.add_argument("--act", type=str, choices=["relu","gdnishlite"], default="relu",
+                    help="活性置換の種類：ReLU または NPU 向け GDNishLite")
     ap.add_argument("--replace_parts", type=str, default="encoder",
                     choices=["encoder","decoder","all"],
-                    help="GDN→ReLU 置換を行うブロック")
+                    help="置換を行うブロック")
     ap.add_argument("--train_scope", type=str, default="replaced+hyper",
                     choices=["replaced","replaced+hyper","all"],
                     help="再学習範囲：置換ブロックのみ / 置換+hyperprior+entropy_bottleneck / 全層")
+
+    # GDNishLite (NPU) params
+    ap.add_argument("--enc_t", type=float, default=2.0)
+    ap.add_argument("--enc_kdw", type=int, default=3)
+    ap.add_argument("--enc_eca", type=str, default="true")
+    ap.add_argument("--enc_residual", type=str, default="true")
+    ap.add_argument("--dec_k", type=int, default=3)
+    ap.add_argument("--dec_gmin", type=float, default=0.5)
+    ap.add_argument("--dec_gmax", type=float, default=2.0)
+    ap.add_argument("--dec_residual", type=str, default="true")
 
     # AMP 設定
     ap.add_argument("--amp", type=str, default="true", help="true で AMP を有効化")
@@ -83,6 +114,17 @@ def get_args():
                     help="特定モジュールを局所的にFP32で実行して数値安定化")
     ap.add_argument("--local_fp32_custom", type=str, default="",
                     help="custom の場合: カンマ区切りでクラス名の部分一致（例: 'EntropyBottleneck,Softmax'）")
+
+    # QAT (lightweight FakeQuant) options
+    ap.add_argument("--qat", type=str, default="false", help="true で軽量QATを有効化（FakeQuant 挿入）")
+    ap.add_argument("--qat_act_observer", type=str, choices=["ema","minmax"], default="ema",
+                    help="活性の観測器タイプ：EMA(推奨) or MinMax")
+    ap.add_argument("--qat_w_per_channel", type=str, default="true",
+                    help="Conv/Linear の weight を per-channel 量子化（推奨 true）")
+    ap.add_argument("--qat_disable_observer_step", type=int, default=5000,
+                    help="この global step 以降、observer を停止してスケールを固定（<0で無効）")
+    ap.add_argument("--qat_eval_fakequant", type=str, default="true",
+                    help="true の場合、検証時も FakeQuant を有効化（推奨）")
 
     # 学習率最適化（スケジューラ/オプティマイザ）
     ap.add_argument("--optimizer", type=str, choices=["adam","adamw"], default="adam")
@@ -125,12 +167,12 @@ def maybe_init_wandb(args):
             print(f"[wandb] Resuming previous run (id={run_id})")
         else:
             base_id = wandb.util.generate_id()
-            run_id = f"{base_id}_{args.replace_parts}_{args.train_scope}"
+            run_id = f"{base_id}_{args.act}_{args.replace_parts}_{args.train_scope}"
             run_id_file.write_text(run_id)
             resume_mode = None
             print(f"[wandb] Starting new run (id={run_id})")
         wandb.init(
-            project=os.environ.get("WANDB_PROJECT", "bmshj2018_relu"),
+            project=os.environ.get("WANDB_PROJECT", "bmshj2018_unified"),
             config=vars(args),
             id=run_id,
             resume=resume_mode
@@ -166,7 +208,6 @@ def save_val_recons(model, loader, device, save_root, tag, wb=None, grid_max=16)
     grid_samples = []
     for x in loader:
         x = x.to(device)
-        # keep unclamped original tensor for saving origin
         x_for_save = x.detach().cpu().clamp(0, 1)
         x_hat = forward_reconstruction(model, x, clamp=True)
 
@@ -175,7 +216,6 @@ def save_val_recons(model, loader, device, save_root, tag, wb=None, grid_max=16)
             recon_path = out_dir / f"{saved:05d}.png"
             save_image(x_hat[b], recon_path)
 
-            # Save origin once (if not existing); indexing stays consistent even if file already present
             origin_path = origin_dir / f"{saved:05d}.png"
             if not origin_path.exists():
                 save_image(x_for_save[b], origin_path)
@@ -238,6 +278,14 @@ def main():
     args = get_args()
     use_prepared = args.use_prepared.lower() == "true"
     do_overflow_check = args.overflow_check.lower() == "true"
+    enc_eca = args.enc_eca.lower() == "true"
+    enc_res = args.enc_residual.lower() == "true"
+    dec_res = args.dec_residual.lower() == "true"
+
+    # QAT flags
+    qat_enabled = args.qat.lower() == "true"
+    qat_w_per_channel = args.qat_w_per_channel.lower() == "true"
+    qat_eval_fakequant = args.qat_eval_fakequant.lower() == "true"
 
     Path(args.save_dir).mkdir(parents=True, exist_ok=True)
     Path(args.recon_dir).mkdir(parents=True, exist_ok=True)
@@ -261,7 +309,31 @@ def main():
 
     # Model
     model = bmshj2018_factorized(quality=args.quality, pretrained=True)
-    model = replace_gdn_with_relu(model, mode=args.replace_parts)
+    if args.act == "relu":
+        model = replace_gdn_with_relu(model, mode=args.replace_parts)
+    else:
+        model = replace_gdn_with_npu(
+            model,
+            mode=args.replace_parts,
+            enc_t=args.enc_t,
+            enc_kdw=args.enc_kdw,
+            enc_use_eca=enc_eca,
+            enc_residual=enc_res,
+            dec_k=args.dec_k,
+            dec_gmin=args.dec_gmin,
+            dec_gmax=args.dec_gmax,
+            dec_residual=dec_res,
+        )
+
+    # QAT prepare (in-place) before moving to device
+    if qat_enabled:
+        print("[QAT] preparing FakeQuant modules in-place ...")
+        prepare_qat_inplace(
+            model,
+            act_observer=args.qat_act_observer,
+            w_per_channel=qat_w_per_channel,
+        )
+
     wrap_modules_for_local_fp32(model, policy=args.local_fp32, custom=args.local_fp32_custom)
     model.to(args.device)
     set_trainable_parts(model, replaced_block=args.replace_parts, train_scope=args.train_scope)
@@ -286,7 +358,8 @@ def main():
 
     # AMP / Scaler
     cuda_available = args.device.startswith("cuda")
-    amp_enabled = cuda_available and (args.amp.lower() == "true")
+    # QAT 中は AMP 無効推奨（観測器との相性）
+    amp_enabled = (not qat_enabled) and cuda_available and (args.amp.lower() == "true")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
@@ -314,6 +387,11 @@ def main():
         save_val_recons(model, recon_loader, args.device, args.recon_dir, tag, wb=wb,
                         grid_max=min(16, args.recon_count))
 
+    # if QAT: start with observers enabled & fakequant enabled
+    if qat_enabled:
+        set_qat_observers_enabled(model, True)
+        set_qat_fakequant_enabled(model, True)
+
     for epoch in range(start_epoch, args.epochs):
         model.train()
         pbar = tqdm(train_loader, desc=f"train e{epoch+1}/{args.epochs}")
@@ -325,6 +403,11 @@ def main():
             if args.lr_warmup_steps > 0 and (global_step < args.lr_warmup_steps):
                 factor = (global_step + 1) / float(args.lr_warmup_steps)
                 _set_lr(opt, base_lr, factor)
+
+            # QAT: turn off observers after threshold step (freeze scales)
+            if qat_enabled and (args.qat_disable_observer_step >= 0) and (global_step == args.qat_disable_observer_step):
+                print(f"[QAT] disabling observers at step {global_step}")
+                set_qat_observers_enabled(model, False)
 
             opt.zero_grad(set_to_none=True)
 
@@ -389,6 +472,7 @@ def main():
                     "PSNR": f"{cur_psnr:.2f}",
                     "lr": f"{opt.param_groups[0]['lr']:.2e}",
                     "amp": int(amp_enabled),
+                    "qat": int(qat_enabled),
                 })
             else:
                 pbar.set_postfix({
@@ -397,6 +481,7 @@ def main():
                     "PSNR": f"{cur_psnr:.2f}",
                     "lr": f"{opt.param_groups[0]['lr']:.2e}",
                     "amp": int(amp_enabled),
+                    "qat": int(qat_enabled),
                 })
 
             # W&B ログ
@@ -405,6 +490,8 @@ def main():
                 "train/msssim": ms_ssim_cur,
                 "train_param/lr": opt.param_groups[0]["lr"],
                 "train_param/amp_enabled": int(amp_enabled),
+                "train_param/qat_enabled": int(qat_enabled),
+                "train_param/step": global_step,
             })
             if args.loss_type == "rd":
                 _wb_log(wb, {
@@ -437,6 +524,9 @@ def main():
 
         # Validation
         model.eval()
+        # QAT: optionally disable fakequant during eval
+        if qat_enabled and not qat_eval_fakequant:
+            set_qat_fakequant_enabled(model, False)
         mss_list, psnr_list = [], []
         with torch.no_grad():
             for x in val_loader:
@@ -445,9 +535,13 @@ def main():
                 _, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
                 mss_list.append(float(logs["ms_ssim"]))
                 psnr_list.append(psnr(x_hat, x).item())
+        # re-enable for next epoch if it was disabled
+        if qat_enabled and not qat_eval_fakequant:
+            set_qat_fakequant_enabled(model, True)
 
         mean_mss = sum(mss_list)/len(mss_list) if mss_list else 0.0
         mean_ps  = sum(psnr_list)/len(psnr_list) if psnr_list else 0.0
+
         print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB  avg_loss={avg_loss:.4f}")
         _wb_log(wb, {
             "val/ms_ssim": mean_mss,
@@ -462,6 +556,7 @@ def main():
             # 監視指標は MS-SSIM（大きいほど良い）
             sched.step(mean_mss)
 
+        # 既定の間隔で再構成画像を PNG 保存（origin は save_val_recons が必要に応じて一度だけ保存）
         if recon_loader is not None and args.recon_every > 0 and ((epoch + 1) % args.recon_every == 0):
             tag = f"e{epoch+1:03d}"
             save_val_recons(model, recon_loader, args.device, args.recon_dir, tag, wb=wb,
