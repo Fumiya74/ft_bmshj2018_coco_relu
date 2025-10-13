@@ -356,7 +356,7 @@ def get_args():
     ap.add_argument("--qat_freeze_after", type=int, default=8000)
 
     ap.add_argument("--resume", type=str, default="")
-    ap.add_argument("--wandb", type=str, default="false")
+    ap.add_argument("--wandb", type=str, default="true")
 
     return ap.parse_args()
 
