@@ -1,143 +1,229 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Lightweight QAT utilities (FakeQuant-only, no FX convert)
-- prepare_qat_inplace(model, ...): insert activation & weight fakequants around Conv/Linear
-- set_qat_observers_enabled(model, enabled)
-- set_qat_fakequant_enabled(model, enabled)
-This aims to stabilize training for NPU/INT8 deployment while keeping the graph export simple.
+Lightweight QAT helpers (FakeQuant-only) with automatic exclusion of
+EntropyBottleneck / GaussianConditional / Hyperprior (h_a, h_s) neighborhood.
 """
-
-from typing import Optional
+from __future__ import annotations
+from typing import Tuple
 import torch
 import torch.nn as nn
 
-# --- Simple FakeQuant + Observer modules ---
-
-def _make_act_observer(kind: str = "ema"):
-    if kind == "minmax":
-        return torch.ao.quantization.MinMaxObserver(quant_min=-128, quant_max=127, dtype=torch.qint8, qscheme=torch.per_tensor_symmetric)
-    # ema (default)
-    return torch.ao.quantization.MovingAverageMinMaxObserver(quant_min=-128, quant_max=127, dtype=torch.qint8, qscheme=torch.per_tensor_symmetric)
-
-def _make_weight_observer(per_channel: bool = True):
-    if per_channel:
-        return torch.ao.quantization.PerChannelMinMaxObserver(dtype=torch.qint8, qscheme=torch.per_channel_symmetric, ch_axis=0)
-    return torch.ao.quantization.MinMaxObserver(dtype=torch.qint8, qscheme=torch.per_tensor_symmetric)
-
-class ActFakeQuant(nn.Module):
-    def __init__(self, observer_kind: str = "ema"):
+class EMAMinMaxObserver(nn.Module):
+    def __init__(self, momentum: float = 0.99, eps: float = 1e-6):
         super().__init__()
-        self.observer = _make_act_observer(observer_kind)
-        self.fake_q = torch.ao.quantization.FakeQuantize(observer=self.observer, quant_min=-128, quant_max=127, dtype=torch.qint8, qscheme=torch.per_tensor_symmetric)
+        self.momentum = momentum
+        self.eps = eps
+        self.register_buffer("min_val", torch.tensor(float("inf")))
+        self.register_buffer("max_val", torch.tensor(float("-inf")))
+        self.register_buffer("frozen", torch.tensor(0, dtype=torch.int32))
 
-    def enable_observer(self, enabled: bool):
-        if hasattr(self.fake_q, "enable_observer"):
-            if enabled: self.fake_q.enable_observer()
-            else: self.fake_q.disable_observer()
+    @torch.no_grad()
+    def update(self, x: torch.Tensor):
+        if int(self.frozen.item()) == 1:
+            return
+        x = x.detach()
+        x_min = torch.min(x)
+        x_max = torch.max(x)
+        if not torch.isfinite(self.min_val):
+            self.min_val.copy_(x_min)
+        if not torch.isfinite(self.max_val):
+            self.max_val.copy_(x_max)
+        self.min_val.mul_(self.momentum).add_(x_min * (1 - self.momentum))
+        self.max_val.mul_(self.momentum).add_(x_max * (1 - self.momentum))
 
-    def enable_fake_quant(self, enabled: bool):
-        if hasattr(self.fake_q, "enable_fake_quant"):
-            if enabled: self.fake_q.enable_fake_quant()
-            else: self.fake_q.disable_fake_quant()
+    def freeze(self, flag: bool = True):
+        self.frozen.fill_(1 if flag else 0)
 
-    def forward(self, x):
-        return self.fake_q(x)
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.update(x)
+        min_v = torch.minimum(self.min_val, self.max_val - self.eps)
+        max_v = torch.maximum(self.max_val, min_v + self.eps)
+        return min_v, max_v
 
-class WeightFakeQuant(nn.Module):
-    def __init__(self, per_channel: bool = True):
+class PerChannelSymObserver(nn.Module):
+    def __init__(self, ch_axis: int = 0, momentum: float = 0.99, eps: float = 1e-6):
         super().__init__()
-        self.observer = _make_weight_observer(per_channel)
-        self.fake_q = torch.ao.quantization.FakeQuantize(observer=self.observer, dtype=torch.qint8,
-                                                         quant_min=-128, quant_max=127,
-                                                         qscheme=(torch.per_channel_symmetric if per_channel else torch.per_tensor_symmetric),
-                                                         ch_axis=0)
+        self.ch_axis = ch_axis
+        self.momentum = momentum
+        self.eps = eps
+        self.register_buffer("max_abs", torch.zeros(1))
+        self.register_buffer("initialized", torch.tensor(0, dtype=torch.int32))
+        self.register_buffer("frozen", torch.tensor(0, dtype=torch.int32))
 
-    def enable_observer(self, enabled: bool):
-        if hasattr(self.fake_q, "enable_observer"):
-            if enabled: self.fake_q.enable_observer()
-            else: self.fake_q.disable_observer()
+    @torch.no_grad()
+    def update(self, w: torch.Tensor):
+        if int(self.frozen.item()) == 1:
+            return
+        max_abs_now = torch.amax(torch.abs(w.detach()), dim=[d for d in range(w.dim()) if d != self.ch_axis])
+        if int(self.initialized.item()) == 0:
+            self.max_abs = max_abs_now.clone()
+            self.initialized.fill_(1)
+        else:
+            self.max_abs.mul_(self.momentum).add_(max_abs_now * (1 - self.momentum))
 
-    def enable_fake_quant(self, enabled: bool):
-        if hasattr(self.fake_q, "enable_fake_quant"):
-            if enabled: self.fake_q.enable_fake_quant()
-            else: self.fake_q.disable_fake_quant()
+    def freeze(self, flag: bool = True):
+        self.frozen.fill_(1 if flag else 0)
 
-    def forward(self, w):
-        return self.fake_q(w)
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        self.update(w)
+        return torch.clamp(self.max_abs, min=self.eps)
 
-# --- Wrappers for Conv/Linear ---
+class FakeQuantAct(nn.Module):
+    def __init__(self, num_bits: int = 8, momentum: float = 0.99):
+        super().__init__()
+        self.observer = EMAMinMaxObserver(momentum=momentum)
+        self.qmin = 0
+        self.qmax = (1 << num_bits) - 1
+        self.enabled = True
 
-class QATConv2d(nn.Conv2d):
-    """Conv2d with input/output/weight fakequant."""
-    def __init__(self, m: nn.Conv2d, act_kind: str = "ema", w_per_channel: bool = True):
-        super().__init__(m.in_channels, m.out_channels, m.kernel_size, m.stride, m.padding,
-                         m.dilation, m.groups, m.bias is not None, m.padding_mode, device=m.weight.device, dtype=m.weight.dtype)
-        # copy weights
-        self.weight = nn.Parameter(m.weight.detach().clone())
-        if m.bias is not None:
-            self.bias = nn.Parameter(m.bias.detach().clone())
-        # fq
-        self.in_fq  = ActFakeQuant(act_kind)
-        self.w_fq   = WeightFakeQuant(w_per_channel)
-        self.out_fq = ActFakeQuant(act_kind)
+    def freeze(self, flag: bool = True):
+        self.observer.freeze(flag)
 
-    def forward(self, x):
-        x = self.in_fq(x)
-        w = self.w_fq(self.weight)
-        y = nn.functional.conv2d(x, w, self.bias, self.stride, self.padding, self.dilation, self.groups)
-        y = self.out_fq(y)
-        return y
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or not self.enabled:
+            return x
+        min_v, max_v = self.observer(x)
+        scale = (max_v - min_v) / max(self.qmax - self.qmin, 1)
+        scale = torch.clamp(scale, min=1e-8)
+        zp = torch.clamp(torch.round(self.qmin - min_v / scale), self.qmin, self.qmax)
+        q = torch.round(x / scale + zp)
+        q = torch.clamp(q, self.qmin, self.qmax)
+        return (q - zp) * scale
 
-class QATLinear(nn.Linear):
-    """Linear with input/output/weight fakequant."""
-    def __init__(self, m: nn.Linear, act_kind: str = "ema", w_per_channel: bool = True):
-        super().__init__(m.in_features, m.out_features, m.bias is not None, device=m.weight.device, dtype=m.weight.dtype)
-        self.weight = nn.Parameter(m.weight.detach().clone())
-        if m.bias is not None:
-            self.bias = nn.Parameter(m.bias.detach().clone())
-        self.in_fq  = ActFakeQuant(act_kind)
-        # per-channel for linear is equivalent to per-row along out_features
-        self.w_fq   = WeightFakeQuant(per_channel=w_per_channel)
-        self.out_fq = ActFakeQuant(act_kind)
+class FakeQuantWPerChannelSym(nn.Module):
+    def __init__(self, ch_axis: int = 0, num_bits: int = 8, momentum: float = 0.99):
+        super().__init__()
+        self.observer = PerChannelSymObserver(ch_axis=ch_axis, momentum=momentum)
+        self.qmax = (1 << (num_bits - 1)) - 1
+        self.enabled = True
+        self.ch_axis = ch_axis
 
-    def forward(self, x):
-        x = self.in_fq(x)
-        w = self.w_fq(self.weight)
-        y = nn.functional.linear(x, w, self.bias)
-        y = self.out_fq(y)
-        return y
+    def freeze(self, flag: bool = True):
+        self.observer.freeze(flag)
 
-# --- Public helpers ---
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        if not self.training or not self.enabled:
+            return w
+        max_abs = self.observer(w)
+        scale = torch.clamp(max_abs / self.qmax, min=1e-8)
+        view = [1] * w.dim()
+        view[self.ch_axis] = -1
+        scale_v = scale.view(*view)
+        q = torch.round(w / scale_v)
+        q = torch.clamp(q, -self.qmax-1, self.qmax)
+        return q * scale_v
 
-def prepare_qat_inplace(model: nn.Module, act_observer: str = "ema", w_per_channel: bool = True) -> None:
-    """Replace Conv2d/Linear by QAT wrapped versions (in-place)."""
-    def _recurse(parent: nn.Module):
-        for name, child in list(parent.named_children()):
-            if isinstance(child, nn.Conv2d):
-                setattr(parent, name, QATConv2d(child, act_kind=act_observer, w_per_channel=w_per_channel))
-            elif isinstance(child, nn.Linear):
-                setattr(parent, name, QATLinear(child, act_kind=act_observer, w_per_channel=w_per_channel))
+EXCLUDE_CLASS_SUBSTR = (
+    "EntropyBottleneck",
+    "GaussianConditional",
+)
+EXCLUDE_NAME_SUBSTR = (
+    "entropy_bottleneck",
+    "gaussian_conditional",
+    "h_a",
+    "h_s",
+)
+
+def _is_entropy_neighborhood(name_path: str, module: nn.Module) -> bool:
+    cname = module.__class__.__name__
+    for s in EXCLUDE_CLASS_SUBSTR:
+        if s.lower() in cname.lower():
+            return True
+    for s in EXCLUDE_NAME_SUBSTR:
+        if s.lower() in name_path.lower():
+            return True
+    return False
+
+def _iter_named_modules(model: nn.Module, prefix: str = ""):
+    for name, child in model.named_children():
+        path = f"{prefix}.{name}" if prefix else name
+        yield path, child
+        yield from _iter_named_modules(child, path)
+
+def _wrap_conv_with_wfq(module: nn.Conv2d) -> nn.Module:
+    class ConvWQ(nn.Conv2d):
+        def __init__(self, base: nn.Conv2d):
+            super().__init__(
+                in_channels=base.in_channels,
+                out_channels=base.out_channels,
+                kernel_size=base.kernel_size,
+                stride=base.stride,
+                padding=base.padding,
+                dilation=base.dilation,
+                groups=base.groups,
+                bias=(base.bias is not None),
+                padding_mode=base.padding_mode,
+            )
+            self.load_state_dict(base.state_dict(), strict=True)
+            self._fq = FakeQuantWPerChannelSym(ch_axis=0)
+        def freeze(self, flag: bool = True):
+            self._fq.freeze(flag)
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            w = self._fq(self.weight)
+            return nn.functional.conv2d(
+                x, w, self.bias, self.stride, self.padding, self.dilation, self.groups
+            )
+    return ConvWQ(module)
+
+def _append_act_fq(parent: nn.Module, name: str, act_mod: nn.Module):
+    seq = nn.Sequential(act_mod, FakeQuantAct())
+    setattr(parent, name, seq)
+
+def prepare_qat_inplace(
+    model: nn.Module,
+    exclude_entropy: bool = True,
+    calib_steps: int = 2000,
+    freeze_after: int = 8000,
+    verbose: bool = True,
+) -> nn.Module:
+    model.register_buffer("_qat_calib_steps", torch.tensor(int(calib_steps)))
+    model.register_buffer("_qat_freeze_after", torch.tensor(int(freeze_after)))
+    model.register_buffer("_qat_global_step", torch.tensor(0, dtype=torch.long))
+
+    replaced_conv = 0
+    appended_act = 0
+
+    for path, mod in list(_iter_named_modules(model)):
+        if exclude_entropy and _is_entropy_neighborhood(path, mod):
+            setattr(mod, "_qat_excluded", True)
+            continue
+        if isinstance(mod, nn.Conv2d):
+            parent_path = ".".join(path.split(".")[:-1])
+            leaf_name = path.split(".")[-1]
+            parent = model
+            if parent_path:
+                for seg in parent_path.split("."):
+                    parent = getattr(parent, seg)
+            setattr(parent, leaf_name, _wrap_conv_with_wfq(mod))
+            replaced_conv += 1
+        elif isinstance(mod, (nn.ReLU, nn.ReLU6, nn.Hardswish)):
+            parent_path = ".".join(path.split(".")[:-1])
+            leaf_name = path.split(".")[-1]
+            parent = model
+            if parent_path:
+                for seg in parent_path.split("."):
+                    parent = getattr(parent, seg)
+            _append_act_fq(parent, leaf_name, mod)
+            appended_act += 1
+
+    if verbose:
+        print(f"[QAT] injected: Conv(w-fq)={replaced_conv}, Act(fq)={appended_act}, exclude_entropy={exclude_entropy}")
+    return model
+
+@torch.no_grad()
+def step_qat_schedule(model: nn.Module, global_step: int):
+    if hasattr(model, "_qat_global_step"):
+        model._qat_global_step.fill_(int(global_step))
+    calib_steps = int(getattr(model, "_qat_calib_steps", torch.tensor(0)).item())
+    freeze_after = int(getattr(model, "_qat_freeze_after", torch.tensor(0)).item())
+    def _apply(m: nn.Module):
+        if isinstance(m, (FakeQuantAct, FakeQuantWPerChannelSym, EMAMinMaxObserver, PerChannelSymObserver)):
+            step = int(getattr(model, "_qat_global_step", torch.tensor(0)).item())
+            if step >= freeze_after:
+                if hasattr(m, "freeze"): m.freeze(True)
+            elif step >= calib_steps:
+                if hasattr(m, "freeze"): m.freeze(True)
             else:
-                _recurse(child)
-    _recurse(model)
-    print(f"[QAT] inserted FakeQuant around Conv/Linear (act_observer={act_observer}, w_per_channel={w_per_channel})")
-
-def set_qat_observers_enabled(model: nn.Module, enabled: bool) -> None:
-    """Enable/disable observers in all fakequant submodules."""
-    for m in model.modules():
-        if hasattr(m, "enable_observer"):
-            m.enable_observer(enabled)
-        for attr in ("in_fq","out_fq","w_fq"):
-            fq = getattr(m, attr, None)
-            if fq is not None and hasattr(fq, "enable_observer"):
-                fq.enable_observer(enabled)
-
-def set_qat_fakequant_enabled(model: nn.Module, enabled: bool) -> None:
-    """Enable/disable fakequant (quantize/dequantize) effect."""
-    for m in model.modules():
-        if hasattr(m, "enable_fake_quant"):
-            m.enable_fake_quant(enabled)
-        for attr in ("in_fq","out_fq","w_fq"):
-            fq = getattr(m, attr, None)
-            if fq is not None and hasattr(fq, "enable_fake_quant"):
-                fq.enable_fake_quant(enabled)
+                if hasattr(m, "freeze"): m.freeze(False)
+    model.apply(_apply)
