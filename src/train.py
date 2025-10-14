@@ -34,7 +34,6 @@ from src.model_utils import (
 from src.replace_gdn_npu import replace_gdn_with_npu
 from src.qat_utils import (
     prepare_qat_inplace,
-    set_qat_observers_enabled,
     set_qat_fakequant_enabled,
 )
 
