@@ -376,7 +376,7 @@ def main():
         )
 
     wrap_modules_for_local_fp32(model, policy=args.local_fp32, custom=args.local_fp32_custom)
-    model.to(args.device)
+    
     set_trainable_parts(model, replaced_block=args.replace_parts, train_scope=args.train_scope)
 
     base_lr = args.lr
@@ -415,7 +415,7 @@ def main():
         )
         print(f"[QAT] enabled scope={args.qat_scope} exclude_entropy={args.qat_exclude_entropy} "
               f"calib_steps={args.qat_calib_steps} freeze_after={args.qat_freeze_after}")
-
+    model.to(args.device)
     # AMP / Scaler
     cuda_available = args.device.startswith("cuda")
     amp_enabled = cuda_available and (args.amp.lower() == "true")
