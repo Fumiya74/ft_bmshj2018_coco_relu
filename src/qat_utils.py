@@ -330,7 +330,7 @@ def prepare_qat_inplace_scoped(model: nn.Module, scope: str = "encoder",
     
     if kwargs.get("verbose", False):
         print(f"[qat] prepare: scope={scope} act_bits={act_bits} w_bits={w_bits} calib_steps={calib_steps} freeze_after={freeze_after}")
-setattr(model, _QAT_TAG, True)
+    setattr(model, _QAT_TAG, True)
     model.register_buffer("_qat_global_step", torch.tensor(0))
     model.register_buffer("_qat_calib_steps", torch.tensor(int(calib_steps)))
     model.register_buffer("_qat_freeze_after", torch.tensor(int(freeze_after)))
