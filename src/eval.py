@@ -9,6 +9,42 @@ from src.dataset_coco import ImageFolder224
 from src.losses import recon_loss, psnr
 from src.model_utils import replace_gdn_with_relu, forward_reconstruction, extract_likelihoods
 
+
+def compute_bpp(likelihoods, x):
+    """bit per pixel (bpp) を計算"""
+    num_pixels = x.size(0) * x.size(2) * x.size(3)
+    total_bits = 0.0
+    for v in likelihoods.values():
+        total_bits += torch.sum(-torch.log2(v)).item()
+    return total_bits / num_pixels
+
+
+@torch.no_grad()
+def evaluate_model(model, val_loader, device):
+    """
+    既存の学習済み model と validation DataLoader を受け取り、
+    MS-SSIM / PSNR / BPP の平均値を返すユーティリティ。
+    """
+    model.eval()
+    mss, psn, bpps = [], [], []
+    for x in tqdm(val_loader, desc="eval"):
+        x = x.to(device)
+        # raw_out も取得して likelihoods を算出（BPP計算用）
+        x_hat, raw_out = forward_reconstruction(model, x, clamp=True, return_all=True)
+        likelihoods = extract_likelihoods(raw_out)
+        bpp_val = compute_bpp(likelihoods, x)
+        bpps.append(bpp_val)
+
+        _, logs = recon_loss(x_hat, x)
+        mss.append(float(logs["ms_ssim"]))
+        psn.append(float(psnr(x_hat, x)))
+    mean_ms_ssim = sum(mss)/len(mss) if mss else 0.0
+    mean_psnr    = sum(psn)/len(psn) if psn else 0.0
+    mean_bpp     = sum(bpps)/len(bpps) if bpps else 0.0
+    return mean_ms_ssim, mean_psnr, mean_bpp
+
+
+# 既存の CLI 実行（単体評価）も従来どおり可能
 def get_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--coco_dir", type=str, required=True)
@@ -21,13 +57,6 @@ def get_args():
     ap.add_argument("--checkpoint", type=str, required=True)
     return ap.parse_args()
 
-def compute_bpp(likelihoods, x):
-    """bit per pixel (bpp) を計算"""
-    num_pixels = x.size(0) * x.size(2) * x.size(3)
-    total_bits = 0.0
-    for v in likelihoods.values():
-        total_bits += torch.sum(-torch.log2(v)).item()
-    return total_bits / num_pixels
 
 def main():
     args = get_args()
@@ -37,28 +66,16 @@ def main():
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     model = bmshj2018_factorized(quality=args.quality, pretrained=True)
-    model = replace_gdn_with_relu(model)
+    model = replace_gdn_with_relu(model)  # 必要に応じてNPU版などに差し替えてOK
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     model.load_state_dict(ckpt["model"], strict=False)
-    model.to(args.device).eval()
+    model.to(args.device)
 
-    mss, psn, bpps = [], [], []
-    with torch.no_grad():
-        for x in tqdm(dl, desc="eval"):
-            x = x.to(args.device)
-            # raw_out も取得して likelihoods を算出
-            x_hat, raw_out = forward_reconstruction(model, x, clamp=True, return_all=True)
-            likelihoods = extract_likelihoods(raw_out)
-            bpp_val = compute_bpp(likelihoods, x)
-            bpps.append(bpp_val)
+    mss, psn, bpp = evaluate_model(model, dl, args.device)
+    print(f"MS-SSIM: {mss:.4f}")
+    print(f"PSNR   : {psn:.2f} dB")
+    print(f"BPP    : {bpp:.4f}")
 
-            _, logs = recon_loss(x_hat, x)
-            mss.append(float(logs["ms_ssim"]))
-            psn.append(float(psnr(x_hat, x)))
-
-    print(f"MS-SSIM: {sum(mss)/len(mss):.4f}")
-    print(f"PSNR   : {sum(psn)/len(psn):.2f} dB")
-    print(f"BPP    : {sum(bpps)/len(bpps):.4f}")
 
 if __name__ == "__main__":
     main()

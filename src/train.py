@@ -24,6 +24,7 @@ from tqdm import tqdm
 from compressai.zoo import bmshj2018_factorized
 from src.dataset_coco import ImageFolder224
 from src.losses import recon_loss, psnr, rd_loss
+from src.eval import evaluate_model
 from src.model_utils import (
     replace_gdn_with_relu,
     set_trainable_parts,
@@ -549,7 +550,7 @@ def main():
                     wb.log({"train/aux_loss": float(aux_loss)})
 
         avg_loss /= max(1, len(train_loader))
-
+        """
         model.eval()
         mss_list, psnr_list = [], []
         with torch.no_grad():
@@ -564,6 +565,13 @@ def main():
         print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB  avg_loss={avg_loss:.4f}")
         if wb is not None:
             wb.log({"val/ms_ssim": mean_mss, "val/psnr": mean_ps, "epoch": epoch+1})
+        """
+                # ===== Validation（eval.pyの関数を呼び出し） =====
+        mean_mss, mean_ps, mean_bpp = evaluate_model(model, val_loader, args.device)
+        print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB  BPP={mean_bpp:.4f}  avg_loss={avg_loss:.4f}")
+
+        if wb is not None:
+            wb.log({"val/ms_ssim": mean_mss, "val/psnr": mean_ps, "val/bpp": mean_bpp, "epoch": epoch+1})
 
         if args.sched in ["cosine"]:
             sched.step()
