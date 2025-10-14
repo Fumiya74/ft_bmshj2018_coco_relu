@@ -1,252 +1,118 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-DRP-AI–safe GDNishLite blocks (full file)
-
-This version avoids Conv1d and tanh so it translates cleanly to DRP‑AI via ONNX.
-All ops are Conv2d (1×1 / depthwise / 3×3), Add, Mul, GlobalAveragePool2d,
-Clamp (for ReLU6 / Hardtanh / HardSigmoid), plus simple arithmetic.
-
-Key changes vs. previous GDNishLite:
-- ECA → SE‑Lite (GAP + 1×1 Conv2d + HardSigmoid implemented as clamp/scale)
-- Decoder gain: tanh removed; uses hardtanh centered at 1 (1 + clamp(·, −a, a))
-- Careful, near‑identity initializations to prevent early overflow
-- No in‑place activations (better for ONNX export)
-
-Tested export target: ONNX opset 13.
+NPU-friendly replacements for GDN/IGDN:
+- GDNishLiteEnc: 1x1 -> ReLU6 -> DW3x3 -> ReLU6 -> 1x1 -> (ECA) [+ residual]
+- GDNishLiteDec: 1x1 -> ReLU6 -> per-channel 1x1 -> HardSigmoid (scaled) -> mul -> kxk [+ residual]
+All ops are ONNX/NPU-friendly and quantization-tolerant.
 """
-from __future__ import annotations
+
 from typing import Optional
-
 import torch
-from torch import nn
-import torch.nn.functional as F
+import torch.nn as nn
 
-__all__ = [
-    "SELite",
-    "GDNishLiteEnc",
-    "GDNishLiteDec",
-]
-
-
-class SELite(nn.Module):
-    """Squeeze-and-Excitation (lite, DRP-AI friendly).
-
-    SE(x) = x * hsigmoid(Conv2d(GAP(x)))
-    where hsigmoid(u) := clamp(u + 3, 0, 6) / 6  (built from Add + Clamp + Div)
-
-    Parameters
-    ----------
-    channels: int
-        Number of channels in/out.
-    reduce: int
-        Reduction ratio for the hidden bottleneck (set to 1 to keep 1×1 only).
-        Using reduce=1 keeps a single Conv2d(C→C).
-    """
-
-    def __init__(self, channels: int, reduce: int = 1) -> None:
+# -------- ECA (Efficient Channel Attention) --------
+class ECA(nn.Module):
+    """GlobalAvgPool -> 1D conv (k=3..7) -> Sigmoid -> per-channel multiplication"""
+    def __init__(self, C: int, k: int = 3):
         super().__init__()
-        assert reduce >= 1
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        c_mid = max(1, channels // reduce)
-        # two-layer MLP with 1×1 convs is often used; to stay simple and DRP‑AI friendly,
-        # we keep a single 1×1 conv. If you want two layers, add another Conv2d+ReLU.
-        self.fc = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
-        nn.init.zeros_(self.fc.bias)
-        # small weight init to avoid early over-scaling
-        nn.init.zeros_(self.fc.weight)
-
-    @staticmethod
-    def _hsigmoid(u: torch.Tensor) -> torch.Tensor:
-        # HardSigmoid(u) = clamp(u+3, 0, 6)/6
-        return torch.clamp(u + 3.0, 0.0, 6.0) / 6.0
+        assert k % 2 == 1, "ECA kernel size k must be odd"
+        self.conv1d = nn.Conv1d(1, 1, kernel_size=k, padding=k//2, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.gap(x)               # [N, C, 1, 1]
-        y = self.fc(y)                # [N, C, 1, 1]
-        y = self._hsigmoid(y)         # [N, C, 1, 1]
-        return x * y                  # scale per channel
+        # x: [N,C,H,W]
+        w = x.mean((2,3), keepdim=True)                 # [N,C,1,1]
+        w = w.squeeze(-1).transpose(1,2)                # [N,1,C]
+        w = self.conv1d(w).transpose(1,2).unsqueeze(-1) # [N,C,1,1]
+        g = torch.sigmoid(w)
+        return x * g
 
+# -------- Scaled HardSigmoid (quantization-friendly gating) --------
+class ScaledHardSigmoid(nn.Module):
+    def __init__(self, g_min: float = 0.5, g_max: float = 2.0):
+        super().__init__()
+        self.g_min = float(g_min)
+        self.g_span = float(g_max - g_min)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # hard-sigmoid: clamp(x/6 + 0.5, 0, 1)
+        h = torch.clamp(x * (1.0/6.0) + 0.5, 0.0, 1.0)
+        return self.g_min + self.g_span * h
+
+# -------- Encoder-side replacement (GDN alternative) --------
 class GDNishLiteEnc(nn.Module):
-    """Encoder-side DRP-AI–friendly surrogate for GDN.
-
-    Structure: 1×1 (C→Ct) → ReLU6 → DWConv(Ct groups) → ReLU6 → 1×1 (Ct→C)
-               → optional SE‑Lite → Clamp([−enc_out_clip, +enc_out_clip])
-               → residual add with learnable scale α (init 0.1)
-
-    Notes
-    -----
-    * All activations are implemented with Clamp/linear ops (no GELU/Swish).
-    * Depthwise conv starts almost zero (center tap 1e−4) to keep numerics tame.
-    * 1×1 convs are identity when shapes match; otherwise start at zeros.
     """
-
-    def __init__(
-        self,
-        C: int,
-        Ct: Optional[int] = None,
-        *,
-        # compatibility aliases / extras from replacement utility
-        t: Optional[int] = None,                 # alias of Ct
-        use_residual: bool = True,
-        use_se: bool = False,
-        use_eca: Optional[bool] = None,          # alias (if provided)
-        dw_kernel_size: int = 3,
-        enc_out_clip: float = 6.0,
-        alpha_init: float = 0.1,
-        se_reduce: int = 1,
-        **kwargs,
-    ) -> None:
+    1x1(C->tC) -> ReLU6 -> DW3x3(tC) -> ReLU6 -> 1x1(tC->C) -> [ECA] -> (+ residual)
+    """
+    def __init__(self, C: int, t: float = 2.0, kdw: int = 3, use_residual: bool = True, use_eca: bool = True):
         super().__init__()
-        assert dw_kernel_size % 2 == 1, "dw_kernel_size must be odd"
-        # resolve aliases
-        if Ct is None:
-            Ct = t if t is not None else C
-        if use_eca is not None:
-            use_se = bool(use_eca)  # map ECA flag to SE-lite on/off
-
-        # Layers
-        self.pw1 = nn.Conv2d(C, Ct, kernel_size=1, bias=True)
-        self.dw = nn.Conv2d(Ct, Ct, kernel_size=dw_kernel_size,
-                            padding=dw_kernel_size // 2, groups=Ct, bias=True)
-        self.pw2 = nn.Conv2d(Ct, C, kernel_size=1, bias=True)
-        self.se = SELite(C, reduce=se_reduce) if use_se else nn.Identity()
-
-        # Residual control
+        Ct = max(1, int(round(C * t)))
+        self.pw1 = nn.Conv2d(C, Ct, 1, bias=True)
+        self.act1 = nn.ReLU6(inplace=True)
+        self.dw  = nn.Conv2d(Ct, Ct, kdw, padding=kdw//2, groups=Ct, bias=True)
+        self.act2 = nn.ReLU6(inplace=True)
+        self.pw2 = nn.Conv2d(Ct, C, 1, bias=True)
+        self.eca = ECA(C, k=3) if use_eca else nn.Identity()
         self.use_res = use_residual
-        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
 
-        # Output clamp for EB input safety
-        self.enc_out_clip = float(enc_out_clip)
+        self._init_identity_like(C, Ct)
 
-        # Initialization
-        self._init_identity_like(C=C, Ct=Ct, dw_kernel_size=dw_kernel_size)
-
-    def _init_identity_like(self, C: int, Ct: int, dw_kernel_size: int) -> None:
-        nn.init.zeros_(self.pw1.bias)
-        nn.init.zeros_(self.pw2.bias)
-        nn.init.zeros_(self.dw.bias)
-
-        if Ct == C:
-            eye = torch.zeros((Ct, C, 1, 1))
-            for i in range(C):
-                eye[i, i, 0, 0] = 1.0
-            with torch.no_grad():
-                self.pw1.weight.copy_(eye)
-                self.pw2.weight.copy_(eye)
-        else:
-            nn.init.zeros_(self.pw1.weight)
-            nn.init.zeros_(self.pw2.weight)
-
+    def _init_identity_like(self, C: int, Ct: int) -> None:
+        # Initialize close to identity to keep pre-trained features stable
+        nn.init.zeros_(self.pw1.weight); nn.init.zeros_(self.pw1.bias)
         with torch.no_grad():
-            self.dw.weight.zero_()
-            c = dw_kernel_size // 2
-            for ch in range(self.dw.weight.shape[0]):
-                self.dw.weight[ch, 0, c, c] = 1e-4
-
-    @staticmethod
-    def _relu6(u: torch.Tensor) -> torch.Tensor:
-        # ReLU6 via clamp(·, 0, 6)
-        return torch.clamp(u, 0.0, 6.0)
+            # first C output channels pass-through
+            eye = torch.zeros_like(self.pw1.weight)    # [Ct,C,1,1]
+            for i in range(min(C, Ct)):
+                eye[i, i, 0, 0] = 1.0
+            self.pw1.weight.copy_(eye)
+        nn.init.zeros_(self.dw.bias); nn.init.zeros_(self.pw2.bias)
+        nn.init.zeros_(self.dw.weight)
+        # small center weight in DW to avoid breaking identity
+        with torch.no_grad():
+            k = self.dw.kernel_size[0]
+            c = k // 2
+            for ch in range(self.dw.out_channels):
+                self.dw.weight[ch, 0, c, c] = 1e-3
+        nn.init.zeros_(self.pw2.weight)
+        with torch.no_grad():
+            # take only first C rows from expanded rep to come back
+            back = torch.zeros_like(self.pw2.weight)   # [C,Ct,1,1]
+            for i in range(min(C, Ct)):
+                back[i, i, 0, 0] = 1.0
+            self.pw2.weight.copy_(back)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.pw1(x)
-        y = self._relu6(y)
-        y = self.dw(y)
-        y = self._relu6(y)
-        y = self.pw2(y)
-        y = self.se(y)
-        y = torch.clamp(y, -self.enc_out_clip, self.enc_out_clip)
-        if self.use_res:
-            return x + self.alpha * y
-        return y
+        y = self.pw2(self.act2(self.dw(self.act1(self.pw1(x)))))
+        y = self.eca(y)
+        return x + y if self.use_res else y
 
-
+# -------- Decoder-side replacement (IGDN alternative) --------
 class GDNishLiteDec(nn.Module):
-    """Decoder-side DRP-AI–friendly surrogate for IGDN.
-
-    Output = (x + kconv(x)) * g
-    with g = clamp(1 + clamp(g_lin(z), −a, +a), gmin, gmax),  z = mix(x)
-
-    Parameters
-    ----------
-    C: int
-        Channels in/out.
-    use_se: bool
-        Whether to enable SE‑Lite scaling after the residual branch.
-    gmin, gmax: float
-        Final gain bounds (0.5–1.3 recommended). Centered around 1 at init.
-    a: float
-        Inner hardtanh half‑width: g_pre = 1 + clamp(g_lin(z), −a, +a)
-    kkernel: int
-        Kernel size for the optional refinement conv. Defaults to 3.
-    use_refine: bool
-        If True, include `kconv`; otherwise Identity.
     """
-
-    def __init__(
-        self,
-        C: int,
-        *,
-        use_se: bool = False,
-        gmin: float = 0.5,
-        gmax: float = 1.3,
-        a: float = 0.3,
-        kkernel: int = 3,
-        use_refine: bool = True,
-        se_reduce: int = 1,
-        # compatibility aliases / extras from replacement utility
-        dec_gmax: Optional[float] = None,    # alias of gmax
-        use_eca: Optional[bool] = None,      # alias of use_se
-        **kwargs,
-    ) -> None:
+    1x1 -> ReLU6 -> per-channel 1x1(groups=C) -> ScaledHardSigmoid -> mul -> kxk Conv [+ residual]
+    Allows gain > 1 to mimic IGDN's "amplification".
+    """
+    def __init__(self, C: int, k: int = 3, g_min: float = 0.5, g_max: float = 2.0, use_residual: bool = True):
         super().__init__()
-        if dec_gmax is not None:
-            gmax = float(dec_gmax)
-        if use_eca is not None:
-            use_se = bool(use_eca)
-        assert gmin > 0 and gmax > gmin, "Invalid gain bounds"
-        assert kkernel % 2 == 1, "kkernel must be odd"
-        assert a > 0.0
-
-        self.gmin = float(gmin)
-        self.gmax = float(gmax)
-        self.a = float(a)
-
-        self.mix = nn.Conv2d(C, C, kernel_size=1, bias=True)
-        self.g_lin = nn.Conv2d(C, C, kernel_size=1, bias=True)
-
-        if use_refine:
-            self.kconv = nn.Conv2d(C, C, kernel_size=kkernel, padding=kkernel // 2, bias=True)
-        else:
-            self.kconv = nn.Identity()
-
-        self.se = SELite(C, reduce=se_reduce) if use_se else nn.Identity()
-
+        self.mix   = nn.Conv2d(C, C, 1, bias=True)
+        self.act   = nn.ReLU6(inplace=True)
+        self.g_lin = nn.Conv2d(C, C, 1, groups=C, bias=True)  # per-channel linear
+        self.g_act = ScaledHardSigmoid(g_min, g_max)
+        self.kconv = nn.Conv2d(C, C, k, padding=k//2, bias=True)
+        self.use_res = use_residual
         self._init_safe()
 
-    def _init_safe(self) -> None:
-        # Zero biases
-        nn.init.zeros_(self.mix.bias)
-        nn.init.zeros_(self.g_lin.bias)
-        if isinstance(self.kconv, nn.Conv2d):
-            nn.init.zeros_(self.kconv.bias)
-        # Start strictly identity‑like: z≈0, g_pre≈1, kconv≈0
-        nn.init.zeros_(self.mix.weight)
+    def _init_safe(self):
+        nn.init.zeros_(self.mix.bias); nn.init.zeros_(self.g_lin.bias); nn.init.zeros_(self.kconv.bias)
+        # small weights to start near identity after residual
+        nn.init.kaiming_uniform_(self.mix.weight, a=1.0)
         nn.init.zeros_(self.g_lin.weight)
-        if isinstance(self.kconv, nn.Conv2d):
-            nn.init.zeros_(self.kconv.weight)
-
-    def _gain(self, z: torch.Tensor) -> torch.Tensor:
-        # g_pre = 1 + clamp(g_lin(z), −a, +a)
-        g_pre = 1.0 + torch.clamp(self.g_lin(z), -self.a, self.a)
-        return torch.clamp(g_pre, self.gmin, self.gmax)
+        nn.init.zeros_(self.kconv.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.mix(x)
-        g = self._gain(z)
-        if isinstance(self.kconv, nn.Conv2d):
-            y = x + self.kconv(x)
-        else:
-            y = x
-        y = self.se(y)
-        return y * g
+        z = self.act(self.mix(x))
+        g = self.g_act(self.g_lin(z))   # [N,C,1,1] effectively
+        y = self.kconv(z * g)
+        return x + y if self.use_res else y
