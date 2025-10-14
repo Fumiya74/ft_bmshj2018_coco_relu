@@ -3,7 +3,7 @@
 """
 Unified training script for bmshj2018_factorized (CompressAI) with GDN replacement:
 - --act relu   : replace GDN/IGDN with ReLU
-- --act gdnish : replace GDN/IGDN with NPU-friendly GDNishLiteEnc/Dec blocks
+- --act gdnish : replace GDN/IGDN with NPU-friendly GDNishLiteEnc/Dec blocks (from src.npu_blocks.py)
 - Optional QAT (fake-quant) with automatic exclusion of EntropyBottleneck/Hyperprior vicinity
   *and* scope selection: --qat_scope {encoder,decoder,all}
 - Optional EntropyBottleneck auxiliary loss optimizer (--eb_aux / --eb_aux_lr)
@@ -12,6 +12,7 @@ Unified training script for bmshj2018_factorized (CompressAI) with GDN replaceme
 import argparse, os
 from pathlib import Path
 from typing import Any
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -32,166 +33,7 @@ from src.model_utils import (
     wrap_modules_for_local_fp32,
     extract_likelihoods,
 )
-
-# GDNish blocks (same as before)
-class ECA(nn.Module):
-    def __init__(self, C: int, k: int = 3):
-        super().__init__(); assert k % 2 == 1
-        self.conv1d = nn.Conv1d(1, 1, kernel_size=k, padding=k//2, bias=False)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = x.mean((2,3), keepdim=True)
-        w = w.squeeze(-1).transpose(1,2)
-        w = self.conv1d(w).transpose(1,2).unsqueeze(-1)
-        g = torch.sigmoid(w)
-        return x * g
-
-class ScaledHardSigmoid(nn.Module):
-    def __init__(self, g_min: float = 0.5, g_max: float = 2.0):
-        super().__init__(); self.g_min=float(g_min); self.g_span=float(g_max-g_min)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = torch.clamp(x * (1.0/6.0) + 0.5, 0.0, 1.0)
-        return self.g_min + self.g_span * h
-
-class GDNishLiteEnc(nn.Module):
-    def __init__(self, channels: int, t: float = 2.0, kdw: int = 3, use_residual: bool = True, use_eca: bool = True):
-        super().__init__()
-        C = int(channels); Ct = max(1, int(round(C * t)))
-        self.pw1 = nn.Conv2d(C, Ct, 1, bias=True)
-        self.act1 = nn.ReLU6(inplace=True)
-        self.dw  = nn.Conv2d(Ct, Ct, kdw, padding=kdw//2, groups=Ct, bias=True)
-        self.act2 = nn.ReLU6(inplace=True)
-        self.pw2 = nn.Conv2d(Ct, C, 1, bias=True)
-        self.eca = ECA(C, k=3) if use_eca else nn.Identity()
-        self.use_res = use_residual
-        self._init_identity_like(C, Ct)
-    def _init_identity_like(self, C: int, Ct: int) -> None:
-        nn.init.zeros_(self.pw1.weight); nn.init.zeros_(self.pw1.bias)
-        with torch.no_grad():
-            eye = torch.zeros_like(self.pw1.weight)
-            for i in range(min(C, Ct)):
-                eye[i, i, 0, 0] = 1.0
-            self.pw1.weight.copy_(eye)
-        nn.init.zeros_(self.dw.bias); nn.init.zeros_(self.pw2.bias)
-        nn.init.zeros_(self.dw.weight)
-        with torch.no_grad():
-            k = self.dw.kernel_size[0]; c = k // 2
-            for ch in range(self.dw.out_channels):
-                self.dw.weight[ch, 0, c, c] = 1e-3
-        nn.init.zeros_(self.pw2.weight)
-        with torch.no_grad():
-            back = torch.zeros_like(self.pw2.weight)
-            for i in range(min(C, Ct)):
-                back[i, i, 0, 0] = 1.0
-            self.pw2.weight.copy_(back)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.pw2(self.act2(self.dw(self.act1(self.pw1(x)))))
-        y = self.eca(y)
-        return x + y if self.use_res else y
-
-class GDNishLiteDec(nn.Module):
-    def __init__(self, channels: int, k: int = 3, g_min: float = 0.5, g_max: float = 2.0, use_residual: bool = True):
-        super().__init__()
-        C = int(channels)
-        self.mix   = nn.Conv2d(C, C, 1, bias=True)
-        self.act   = nn.ReLU6(inplace=True)
-        self.g_lin = nn.Conv2d(C, C, 1, groups=C, bias=True)
-        self.g_act = ScaledHardSigmoid(g_min, g_max)
-        self.kconv = nn.Conv2d(C, C, k, padding=k//2, bias=True)
-        self.use_res = use_residual
-        self._init_safe()
-    def _init_safe(self):
-        nn.init.zeros_(self.mix.bias); nn.init.zeros_(self.g_lin.bias); nn.init.zeros_(self.kconv.bias)
-        nn.init.kaiming_uniform_(self.mix.weight, a=1.0)
-        nn.init.zeros_(self.g_lin.weight); nn.init.zeros_(self.kconv.weight)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.act(self.mix(x))
-        g = self.g_act(self.g_lin(z))
-        y = self.kconv(z * g)
-        return x + y if self.use_res else y
-
-def _is_gdn_like(m: nn.Module) -> bool:
-    name = m.__class__.__name__.lower()
-    if "gdn" in name or "generalizeddivisivenorm" in name or "igdn" in name:
-        return True
-    try:
-        from compressai.layers import GDN
-        if isinstance(m, GDN): return True
-    except Exception:
-        pass
-    return False
-
-def _infer_channels_from_parent(parent: nn.Module, name: str) -> int:
-    prev = None
-    for k, v in parent.named_children():
-        if k == name:
-            break
-        prev = v
-    if isinstance(prev, nn.Conv2d):
-        return prev.out_channels
-    cur = getattr(parent, name)
-    if hasattr(cur, "channels"):
-        return int(getattr(cur, "channels"))
-    raise ValueError("Cannot infer channel count for GDN module; please pass standard CompressAI modules.")
-
-def replace_gdn_with_gdnish(model: nn.Module, mode: str, enc_t: float, enc_kdw: int, enc_use_eca: bool, enc_use_res: bool,
-                            dec_k: int, dec_gmin: float, dec_gmax: float, dec_use_res: bool):
-    mode = mode.lower(); assert mode in {"encoder","decoder","all"}
-    def _replace_in(module: nn.Module, side_hint: str) -> int:
-        replaced = 0
-        for name, child in list(module.named_children()):
-            if _is_gdn_like(child):
-                try:
-                    C = _infer_channels_from_parent(module, name)
-                except Exception:
-                    C = None
-                    kids = list(module.named_children())
-                    idx = [i for i,(k,_) in enumerate(kids) if k==name][0]
-                    for j in range(idx+1, len(kids)):
-                        n2, m2 = kids[j]
-                        if isinstance(m2, nn.Conv2d):
-                            C = m2.in_channels; break
-                    if C is None: raise
-                if side_hint == "encoder":
-                    new_block = GDNishLiteEnc(channels=C, t=enc_t, kdw=enc_kdw, use_residual=enc_use_res, use_eca=enc_use_eca)
-                else:
-                    new_block = GDNishLiteDec(channels=C, k=dec_k, g_min=dec_gmin, g_max=dec_gmax, use_residual=dec_use_res)
-                setattr(module, name, new_block)
-                replaced += 1
-            else:
-                replaced += _replace_in(child, side_hint)
-        return replaced
-    total = 0
-    has_ga = hasattr(model, "g_a") and isinstance(getattr(model, "g_a"), nn.Module)
-    has_gs = hasattr(model, "g_s") and isinstance(getattr(model, "g_s"), nn.Module)
-    if mode in ("encoder","all"):
-        total += _replace_in(getattr(model, "g_a") if has_ga else model, "encoder")
-    if mode in ("decoder","all"):
-        total += _replace_in(getattr(model, "g_s") if has_gs else model, "decoder")
-    print(f"[replace_gdn_with_gdnish] Replaced {total} GDN/IGDN(s) with GDNishLite (mode='{mode}')")
-    return model, total
-
-# EB aux helpers
-def _collect_eb_aux_params(model: nn.Module):
-    params = []
-    for m in model.modules():
-        if hasattr(m, "entropy_bottleneck"):
-            params += list(m.entropy_bottleneck.parameters())
-    return params
-
-def _compute_eb_aux_loss(model: nn.Module):
-    loss = 0.0
-    for m in model.modules():
-        if hasattr(m, "entropy_bottleneck"):
-            eb = m.entropy_bottleneck
-            if hasattr(eb, "loss"):
-                loss = loss + eb.loss()
-    return loss
-
-# QAT: import new scoped helpers
-from src.qat_utils import (
-    prepare_qat_inplace_scoped,
-    step_qat_schedule,
-)
+from src.replace_gdn_npu import replace_gdn_with_npu  # << refactored import
 
 def get_args():
     ap = argparse.ArgumentParser()
@@ -214,6 +56,7 @@ def get_args():
     ap.add_argument("--replace_parts", type=str, default="encoder", choices=["encoder","decoder","all"])
     ap.add_argument("--train_scope", type=str, default="replaced+hyper", choices=["replaced","replaced+hyper","all"])
 
+    # NPU-friendly GDNishLite knobs (mapped to src.replace_gdn_npu)
     ap.add_argument("--enc_t", type=float, default=2.0)
     ap.add_argument("--enc_kdw", type=int, default=3)
     ap.add_argument("--enc_eca", type=str, default="true")
@@ -367,17 +210,20 @@ def main():
 
     model = bmshj2018_factorized(quality=args.quality, pretrained=True)
 
+    # === GDN replacement ===
     if args.act == "relu":
         model = replace_gdn_with_relu(model, mode=args.replace_parts)
     else:
-        model, _ = replace_gdn_with_gdnish(
-            model, args.replace_parts,
-            enc_t=args.enc_t, enc_kdw=args.enc_kdw, enc_use_eca=enc_eca, enc_use_res=enc_res,
-            dec_k=args.dec_k, dec_gmin=args.dec_gmin, dec_gmax=args.dec_gmax, dec_use_res=dec_res
+        # Uses refactored NPU-friendly replacer
+        model = replace_gdn_with_npu(
+            model,
+            mode=args.replace_parts,
+            enc_t=args.enc_t, enc_kdw=args.enc_kdw, enc_use_eca=enc_eca, enc_residual=enc_res,
+            dec_k=args.dec_k, dec_gmin=args.dec_gmin, dec_gmax=args.dec_gmax, dec_residual=dec_res,
+            verbose=True,
         )
 
     wrap_modules_for_local_fp32(model, policy=args.local_fp32, custom=args.local_fp32_custom)
-    
     set_trainable_parts(model, replaced_block=args.replace_parts, train_scope=args.train_scope)
 
     base_lr = args.lr
@@ -417,6 +263,7 @@ def main():
         print(f"[QAT] enabled scope={args.qat_scope} exclude_entropy={args.qat_exclude_entropy} "
               f"calib_steps={args.qat_calib_steps} freeze_after={args.qat_freeze_after}")
     model.to(args.device)
+
     # AMP / Scaler
     cuda_available = args.device.startswith("cuda")
     amp_enabled = cuda_available and (args.amp.lower() == "true")
@@ -550,23 +397,8 @@ def main():
                     wb.log({"train/aux_loss": float(aux_loss)})
 
         avg_loss /= max(1, len(train_loader))
-        """
-        model.eval()
-        mss_list, psnr_list = [], []
-        with torch.no_grad():
-            for x in val_loader:
-                x = x.to(args.device)
-                x_hat = forward_reconstruction(model, x, clamp=True)
-                _, logs = recon_loss(x_hat, x, alpha_l1=args.alpha_l1)
-                mss_list.append(float(logs["ms_ssim"]))
-                psnr_list.append(psnr(x_hat, x).item())
-        mean_mss = sum(mss_list)/len(mss_list) if mss_list else 0.0
-        mean_ps  = sum(psnr_list)/len(psnr_list) if psnr_list else 0.0
-        print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB  avg_loss={avg_loss:.4f}")
-        if wb is not None:
-            wb.log({"val/ms_ssim": mean_mss, "val/psnr": mean_ps, "epoch": epoch+1})
-        """
-                # ===== Validation（eval.pyの関数を呼び出し） =====
+
+        # ===== Validation（eval.pyの関数を呼び出し） =====
         mean_mss, mean_ps, mean_bpp = evaluate_model(model, val_loader, args.device)
         print(f"[val] epoch={epoch+1}  MS-SSIM={mean_mss:.4f}  PSNR={mean_ps:.2f}dB  BPP={mean_bpp:.4f}  avg_loss={avg_loss:.4f}")
 
@@ -583,18 +415,42 @@ def main():
             save_val_recons(model, recon_loader, args.device, args.recon_dir, tag, wb=wb,
                             grid_max=min(16, args.recon_count))
 
+        # --------- Save checkpoints (training-state) ---------
         ckpt = {"epoch": epoch, "model": model.state_dict(), "opt": opt.state_dict(),
                 "best_msssim": mean_mss, "args": vars(args)}
         if aux_opt is not None:
             ckpt["aux_opt"] = aux_opt.state_dict()
         Path(args.save_dir).mkdir(parents=True, exist_ok=True)
         torch.save(ckpt, os.path.join(args.save_dir, "last.pt"))
+
+        # Best score handling
         if mean_mss > getattr(main, "_best_mss_", 0.0):
             main._best_mss_ = mean_mss
             torch.save(ckpt, os.path.join(args.save_dir, "best_msssim.pt"))
 
+            # ---- Deploy snapshot with CDF updated ----
+            snap = deepcopy(model).eval()
+            if hasattr(snap, "update"):
+                print("[best] Building CDF tables for deploy snapshot...")
+                snap.update()  # build CDF buffers
+            deploy_ckpt = {
+                "epoch": epoch,
+                "model": snap.state_dict(),  # includes updated CDF buffers
+                "best_msssim": mean_mss,
+                "args": vars(args),
+            }
+            out_path = os.path.join(args.save_dir, "best_msssim_cdf.pt")
+            torch.save(deploy_ckpt, out_path)
+            print(f"[best] Saved deploy snapshot: {out_path}")
+
+    # ===== Post training: finalize CDF and save final_updated.pt =====
     if (args.eb_aux.lower() == "true") and hasattr(model, "update"):
-        print("[post] Updating entropy bottleneck CDF tables..."); model.update()
+        print("[post] Updating entropy bottleneck CDF tables...")
+        model.update()
+        final_ckpt = {"model": model.state_dict(), "args": vars(args)}
+        out_path = os.path.join(args.save_dir, "final_updated.pt")
+        torch.save(final_ckpt, out_path)
+        print(f"[post] Saved final model (after CDF update): {out_path}")
 
     print("Done.")
 

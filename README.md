@@ -183,17 +183,21 @@ python -m src.train \
 - 勾配クリッピング、forward 出力の NaN/Inf/過大値チェック
 
 ---
+
 ## 3'. 軽量 QAT（FakeQuant のみ / AMP 非推奨）
 
 **目的**：量子化耐性の改善（学習時に Q/DQ の影響を模擬）  
-**実装**：`src/qat_utils.py` の FakeQuant ラッパを Conv/Linear に in-place で挿入。
+**実装**：`src/qat_utils.py` の FakeQuant ラッパを Conv/Linear に in-place で挿入。  
+EntropyBottleneck / Hyperprior 近傍は自動除外されます。
 
-### 使い方（例：ReLU + RD 学習 + QAT）
+---
+
+### 実行例（ReLU + RD 学習 + QAT）
+
 ```bash
-# encoderのみQATしながら全層学習
 python -m src.train \
   --act relu \
-  --replace_parts encoder --train_scope all\
+  --replace_parts encoder --train_scope all \
   --qat true --qat_scope encoder --qat_exclude_entropy true \
   --qat_calib_steps 2000 --qat_freeze_after 8000 \
   --coco_dir /path/to/coco224 --use_prepared true \
@@ -203,38 +207,75 @@ python -m src.train \
   --sched cosine --optimizer adamw --weight_decay 1e-4
 ```
 
-### 使い方（例：GDNishLite + RD 学習 + QAT）
-```bash
-python -m src.train \
-  --coco_dir /path/to/coco224 \
-  --use_prepared true \
-  --quality 8 --epochs 10 --batch_size 16 \
-  --lr 1e-4 --alpha_l1 0.4 \
-  --act gdnishlite --replace_parts all --train_scope replaced+hyper \
-  --enc_t 2.0 --enc_kdw 3 --enc_eca true --enc_residual true \
-  --dec_k 3 --dec_gmin 0.5 --dec_gmax 2.0 --dec_residual true \
-  --loss_type rd --lambda_bpp 0.01 \
-  --qat true --qat_act_observer ema --qat_w_per_channel true \
-  --qat_disable_observer_step 5000 --qat_eval_fakequant true \
-  --amp false \
-  --recon_every 2 --recon_count 16 \
-  --save_dir ./checkpoints_qat --recon_dir ./recon_qat \
-  --local_fp32 entropy+decoder --sched cosine --optimizer adamw --weight_decay 1e-4
-```
+---
 
-### QAT オプション
-- `--qat {true,false}`：軽量QATの有効化（既定 false）
-- `--qat_exclude_entropy {true,false}`: EntropyBottleneck / Hyperprior 近傍を自動除外（既定 true）
-- `--qat_act_observer {ema,minmax}`：活性観測（推奨 `ema`）
-- `--qat_calib_steps INT`: 観測器のレンジ学習（EMA）期間（既定 2000）
-- `--qat_freeze_after INT`: 以降は観測器を凍結（既定 8000）
-- `--qat_w_per_channel {true,false}`：Conv/Linear の重みを per-channel 量子化（推奨 true）
-- `--qat_disable_observer_step <int>`：指定 step 以降 observer を無効化して scale を固定（<0 で無効）
-- `--qat_eval_fakequant {true,false}`：検証時も FakeQuant を有効化（推奨 true）
-- **注意**：QAT 有効時は **AMP を自動的に無効化**（観測器と AMP の同時使用は非推奨）
+### 🔸 QATパラメータ詳細
+
+| パラメータ | 型 / 既定値 | 説明・挙動 |
+|-------------|-------------|-------------|
+| `--qat` | bool (`false`) | QATを有効化（FakeQuant挿入） |
+| `--qat_scope` | {"encoder","decoder","all"} | どのブロックに挿入するか |
+| `--qat_exclude_entropy` | bool (`true`) | EntropyBottleneck/Hyperprior近傍を除外 |
+| `--qat_calib_steps` | int (`2000`) | 観測器（observer）のレンジ学習期間 |
+| `--qat_freeze_after` | int (`8000`) | このステップ以降、観測器を固定（scale確定） |
+| `--qat_act_observer` | {"ema","minmax"} | 活性観測方式（EMA推奨） |
+| `--qat_w_per_channel` | bool (`true`) | Conv重みをper-channel量子化 |
+| `--qat_disable_observer_step` | int (`<0`) | 指定step以降observer無効化（任意） |
+| `--qat_eval_fakequant` | bool (`true`) | 検証時もFakeQuantを有効化 |
+| `--amp` | bool (`false` 推奨) | QATとAMPの併用は非推奨（NaNを招きやすい） |
 
 ---
 
+### 🔸 用語補足：「Quant値とは？」
+
+量子化（Quantization）では、連続値（float）を整数（int8など）に離散化します。  
+このとき得られる整数値を **Quant値（量子化値）** と呼びます。  
+QATでは順伝播時に `x → Quant(x)` を模擬し、逆伝播では  
+量子化誤差を無視して勾配を流す（Straight-Through Estimator: STE）ことで、  
+モデルが量子化誤差を含む出力にも頑健になるよう訓練されます。  
+FakeQuant層は内部的にはfloat演算ですが、出力レンジをint8相当範囲に制限します。
+
+---
+
+### 🔸 QATのフェーズ動作（詳細）
+
+| フェーズ | ステップ範囲 | 挙動 |
+|-----------|---------------|------|
+| **Calibration** | 0〜`qat_calib_steps` | min/maxをEMAで推定（スケール観測中） |
+| **Freeze（固定スケール学習）** | `qat_calib_steps`〜`qat_freeze_after` | 観測器をfreezeし、固定スケールでFakeQuantを継続 |
+| **Eval-ready（推論模擬段階）** | `> qat_freeze_after` | 観測器を完全固定し、量子化スケール下で安定学習を継続 |
+
+> ⚙️ **補足**：  
+> `qat_freeze_after` 以降も Conv/Linear 層は学習を継続します。  
+> 凍結されるのは「観測器のスケール範囲」のみで、勾配更新は停止しません。
+
+---
+
+### 🔸 freeze と disable の違い
+
+| 状態 | Observer更新 | FakeQuant適用 | Conv/Linear学習 | 説明 |
+|------|----------------|----------------|-------------------|------|
+| **freeze** | ❌ しない | ✅ 継続する | ✅ 継続する | 量子化スケールを固定して訓練（本実装のデフォルト） |
+| **disable** | ❌ しない | ❌ 停止する | ✅ 継続する | 量子化模擬を完全に無効化（float挙動に戻す） |
+
+> 本実装の `qat_utils.py` は `freeze` のみを自動制御します。  
+> 推論時は `eval()` 状態でFakeQuantが残る設計になっており、  
+> 実際のINT8挙動に近い再現を維持します。
+
+---
+
+### 🔸 QAT 安定化 Tips
+
+- AMPは**無効推奨**（`--amp false`）
+- 学習率は**1e-4以下**が安定
+- `entropy+decoder` で局所FP32を有効化（`--local_fp32 entropy+decoder`）
+- まずは **encoderのみQAT** から始めると安定
+- bf16よりもfp32モードでの訓練が安定
+- 長めのウォームアップ (`--lr_warmup_steps 1000`) 併用可
+- 学習後は `model.update()` を実行してCDFテーブルを再構築
+
+
+## 4.
 ## 4. 評価
 
 ```bash
