@@ -85,16 +85,24 @@ class GDNishLiteEnc(nn.Module):
         C: int,
         Ct: Optional[int] = None,
         *,
+        # compatibility aliases / extras from replacement utility
+        t: Optional[int] = None,                 # alias of Ct
         use_residual: bool = True,
         use_se: bool = False,
+        use_eca: Optional[bool] = None,          # alias (if provided)
         dw_kernel_size: int = 3,
         enc_out_clip: float = 6.0,
         alpha_init: float = 0.1,
         se_reduce: int = 1,
+        **kwargs,
     ) -> None:
         super().__init__()
         assert dw_kernel_size % 2 == 1, "dw_kernel_size must be odd"
-        Ct = C if Ct is None else Ct
+        # resolve aliases
+        if Ct is None:
+            Ct = t if t is not None else C
+        if use_eca is not None:
+            use_se = bool(use_eca)  # map ECA flag to SE-lite on/off
 
         # Layers
         self.pw1 = nn.Conv2d(C, Ct, kernel_size=1, bias=True)
@@ -186,8 +194,16 @@ class GDNishLiteDec(nn.Module):
         kkernel: int = 3,
         use_refine: bool = True,
         se_reduce: int = 1,
+        # compatibility aliases / extras from replacement utility
+        dec_gmax: Optional[float] = None,    # alias of gmax
+        use_eca: Optional[bool] = None,      # alias of use_se
+        **kwargs,
     ) -> None:
         super().__init__()
+        if dec_gmax is not None:
+            gmax = float(dec_gmax)
+        if use_eca is not None:
+            use_se = bool(use_eca)
         assert gmin > 0 and gmax > gmin, "Invalid gain bounds"
         assert kkernel % 2 == 1, "kkernel must be odd"
         assert a > 0.0
