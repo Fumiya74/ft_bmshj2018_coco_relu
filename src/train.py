@@ -226,27 +226,6 @@ def main():
         )
 
     wrap_modules_for_local_fp32(model, policy=args.local_fp32, custom=args.local_fp32_custom)
-    set_trainable_parts(model, replaced_block=args.replace_parts, train_scope=args.train_scope)
-
-    base_lr = args.lr
-    params = [p for p in model.parameters() if p.requires_grad]
-    opt = _build_optimizer(args, params)
-    steps_per_epoch = max(1, len(train_loader))
-    sched = _build_scheduler(args, opt, steps_per_epoch)
-
-    # EB aux optimizer (optional)
-    use_eb_aux = args.eb_aux.lower() == "true"
-    aux_opt = None
-    if use_eb_aux:
-        eb_params = []
-        for m in model.modules():
-            if hasattr(m, "entropy_bottleneck"):
-                eb_params += list(m.entropy_bottleneck.parameters())
-        if len(eb_params) == 0:
-            print("[warn] No EntropyBottleneck params found for aux optimizer. --eb_aux will be ignored.")
-            use_eb_aux = False
-        else:
-            aux_opt = torch.optim.Adam(eb_params, lr=args.eb_aux_lr)
 
     # QAT (optional + scope)
     use_qat = args.qat.lower() == "true"
@@ -281,6 +260,28 @@ def main():
         )
         print(f"[QAT] enabled scope={args.qat_scope} exclude_entropy={args.qat_exclude_entropy} "
               f"calib_steps={args.qat_calib_steps} freeze_after={args.qat_freeze_after}")
+    # Ensure trainable-mask reflects any module replacements that happened above
+    set_trainable_parts(model, replaced_block=args.replace_parts, train_scope=args.train_scope)
+
+    base_lr = args.lr
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = _build_optimizer(args, params)
+    steps_per_epoch = max(1, len(train_loader))
+    sched = _build_scheduler(args, opt, steps_per_epoch)
+
+    # EB aux optimizer (optional)
+    use_eb_aux = args.eb_aux.lower() == "true"
+    aux_opt = None
+    if use_eb_aux:
+        eb_params = []
+        for m in model.modules():
+            if hasattr(m, "entropy_bottleneck"):
+                eb_params += list(m.entropy_bottleneck.parameters())
+        if len(eb_params) == 0:
+            print("[warn] No EntropyBottleneck params found for aux optimizer. --eb_aux will be ignored.")
+            use_eb_aux = False
+        else:
+            aux_opt = torch.optim.Adam(eb_params, lr=args.eb_aux_lr)
     model.to(args.device)
 
     # AMP / Scaler
