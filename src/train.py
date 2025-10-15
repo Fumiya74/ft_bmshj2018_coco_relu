@@ -94,6 +94,8 @@ def get_args():
     ap.add_argument("--qat_exclude_entropy", type=str, default="true")
     ap.add_argument("--qat_calib_steps", type=int, default=2000)
     ap.add_argument("--qat_freeze_after", type=int, default=8000)
+    ap.add_argument("--qat_init", type=str, default="",
+                    help="Path to pretrained weights for QAT (defaults to {save_dir}/final_updated.pt)")
 
     ap.add_argument("--resume", type=str, default="")
     ap.add_argument("--wandb", type=str, default="true")
@@ -249,6 +251,23 @@ def main():
     # QAT (optional + scope)
     use_qat = args.qat.lower() == "true"
     if use_qat:
+        if not args.resume:
+            init_path = Path(args.qat_init) if args.qat_init else (Path(args.save_dir) / "final_updated.pt")
+            if init_path.exists():
+                print(f"[QAT] Loading initialization weights from {init_path}")
+                ckpt = torch.load(init_path, map_location="cpu")
+                missing, unexpected = model.load_state_dict(ckpt.get("model", ckpt), strict=False)
+                if missing:
+                    print(f"[QAT] load_state_dict missing keys: {missing}")
+                if unexpected:
+                    print(f"[QAT] load_state_dict unexpected keys: {unexpected}")
+                if hasattr(model, "update"):
+                    # Ensure entropy bottlenecks rebuild their CDF tables for Forward pass consistency.
+                    model.update()
+            else:
+                print(f"[QAT] init weights not found at {init_path}; proceeding with default pretrained weights.")
+        else:
+            print("[QAT] --resume specified; skipping qat_init preload.")
         from src.qat_utils import prepare_qat_inplace_scoped
         prepare_qat_inplace_scoped(
             model,
