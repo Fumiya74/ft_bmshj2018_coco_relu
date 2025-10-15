@@ -184,11 +184,12 @@ python -m src.train \
 
 ---
 
-## 3'. 軽量 QAT（FakeQuant のみ / AMP 非推奨）
+## 3'. QAT（DRP-AI 仕様の FakeQuant）
 
-**目的**：量子化耐性の改善（学習時に Q/DQ の影響を模擬）  
-**実装**：`src/qat_utils.py` の FakeQuant ラッパを Conv/Linear に in-place で挿入。  
-EntropyBottleneck / Hyperprior 近傍は自動除外されます。
+**目的**：DRP-AI TVM 公式スクリプトと同じ FakeQuant 設定で量子化ノイズを模擬し、INT8 推論時の劣化を抑える。  
+**実装**：`src/qat_utils.py` が PyTorch `prepare_qat` を用いて Conv/Linear に FakeQuant/Observer を挿入します。  
+活性は MovingAverageMinMaxObserver（uint8, per-tensor）、重みは MovingAveragePerChannelMinMaxObserver（int8, per-channel）を使用し、  
+EntropyBottleneck / Hyperprior 近傍は常に除外されます。
 
 ---
 
@@ -204,75 +205,49 @@ python -m src.train \
   --quality 8 --epochs 10 --batch_size 16 \
   --lr 1e-4 --alpha_l1 0.4 \
   --loss_type rd --lambda_bpp 0.01 \
-  --sched cosine --optimizer adamw --weight_decay 1e-4
+  --sched cosine --optimizer adamw --weight_decay 1e-4 \
+  --qat_init ./checkpoints/final_updated.pt
 ```
 
 ---
 
-### 🔸 QATパラメータ詳細
+### 🔸 QAT パラメータ詳細
 
 | パラメータ | 型 / 既定値 | 説明・挙動 |
 |-------------|-------------|-------------|
-| `--qat` | bool (`false`) | QATを有効化（FakeQuant挿入） |
-| `--qat_scope` | {"encoder","decoder","all"} | どのブロックに挿入するか |
-| `--qat_exclude_entropy` | bool (`true`) | EntropyBottleneck/Hyperprior近傍を除外 |
-| `--qat_calib_steps` | int (`2000`) | 観測器（observer）のレンジ学習期間 |
-| `--qat_freeze_after` | int (`8000`) | このステップ以降、観測器を固定（scale確定） |
-| `--qat_act_observer` | {"ema","minmax"} | 活性観測方式（EMA推奨） |
-| `--qat_w_per_channel` | bool (`true`) | Conv重みをper-channel量子化 |
-| `--qat_disable_observer_step` | int (`<0`) | 指定step以降observer無効化（任意） |
-| `--qat_eval_fakequant` | bool (`true`) | 検証時もFakeQuantを有効化 |
-| `--amp` | bool (`false` 推奨) | QATとAMPの併用は非推奨（NaNを招きやすい） |
+| `--qat` | bool (`false`) | QAT を有効化（DRP-AI 仕様の FakeQuant を挿入） |
+| `--qat_scope` | {"encoder","decoder","all"} | FakeQuant を挿入するブロック |
+| `--qat_exclude_entropy` | bool (`true`) | EntropyBottleneck / Hyperprior を常に除外 |
+| `--qat_calib_steps` | int (`2000`) | Calibration フェーズの長さ（observer のみ動作） |
+| `--qat_freeze_after` | int (`8000`) | このステップ以降 observer を停止（FakeQuant は継続） |
+| `--qat_init` | str (`""`) | 初期重みのパス（未指定時は `save_dir/final_updated.pt` を自動読み込み） |
+
+> ℹ️ `prepare_qat` で FakeQuant が埋め込まれるため、QAT 開始前に `final_updated.pt` を読み込むと安定します。
 
 ---
 
-### 🔸 用語補足：「Quant値とは？」
+### 🔸 QAT フェーズ動作
 
-量子化（Quantization）では、連続値（float）を整数（int8など）に離散化します。  
-このとき得られる整数値を **Quant値（量子化値）** と呼びます。  
-QATでは順伝播時に `x → Quant(x)` を模擬し、逆伝播では  
-量子化誤差を無視して勾配を流す（Straight-Through Estimator: STE）ことで、  
-モデルが量子化誤差を含む出力にも頑健になるよう訓練されます。  
-FakeQuant層は内部的にはfloat演算ですが、出力レンジをint8相当範囲に制限します。
+| フェーズ | 条件 | 挙動 |
+|-----------|------|------|
+| **Calibration** | `global_step < qat_calib_steps` | FakeQuant を無効化し observer のみ起動（レンジ計測） |
+| **Train** | `qat_calib_steps ≤ step < qat_freeze_after` | FakeQuant と observer を両方有効化 |
+| **Freeze** | `step ≥ qat_freeze_after` | FakeQuant を維持し observer を停止、BN 統計も凍結 |
 
----
-
-### 🔸 QATのフェーズ動作（詳細）
-
-| フェーズ | ステップ範囲 | 挙動 |
-|-----------|---------------|------|
-| **Calibration** | 0〜`qat_calib_steps` | min/maxをEMAで推定（スケール観測中） |
-| **Freeze（固定スケール学習）** | `qat_calib_steps`〜`qat_freeze_after` | 観測器をfreezeし、固定スケールでFakeQuantを継続 |
-| **Eval-ready（推論模擬段階）** | `> qat_freeze_after` | 観測器を完全固定し、量子化スケール下で安定学習を継続 |
-
-> ⚙️ **補足**：  
-> `qat_freeze_after` 以降も Conv/Linear 層は学習を継続します。  
-> 凍結されるのは「観測器のスケール範囲」のみで、勾配更新は停止しません。
-
----
-
-### 🔸 freeze と disable の違い
-
-| 状態 | Observer更新 | FakeQuant適用 | Conv/Linear学習 | 説明 |
-|------|----------------|----------------|-------------------|------|
-| **freeze** | ❌ しない | ✅ 継続する | ✅ 継続する | 量子化スケールを固定して訓練（本実装のデフォルト） |
-| **disable** | ❌ しない | ❌ 停止する | ✅ 継続する | 量子化模擬を完全に無効化（float挙動に戻す） |
-
-> 本実装の `qat_utils.py` は `freeze` のみを自動制御します。  
-> 推論時は `eval()` 状態でFakeQuantが残る設計になっており、  
-> 実際のINT8挙動に近い再現を維持します。
+`src.qat_utils.step_qat_schedule(model, global_step)` が各ステップで自動的に切り替えます。  
+`model.eval()` でも FakeQuant が残るため、INT8 相当の挙動で評価されます。
 
 ---
 
 ### 🔸 QAT 安定化 Tips
 
-- AMPは**無効推奨**（`--amp false`）
-- 学習率は**1e-4以下**が安定
-- `entropy+decoder` で局所FP32を有効化（`--local_fp32 entropy+decoder`）
-- まずは **encoderのみQAT** から始めると安定
-- bf16よりもfp32モードでの訓練が安定
-- 長めのウォームアップ (`--lr_warmup_steps 1000`) 併用可
-- 学習後は `model.update()` を実行してCDFテーブルを再構築
+- AMP と併用する場合は bf16 を推奨（さらに安定性が必要なら `--amp false`）
+- `--qat_init` で `final_updated.pt` を起点にするとレンジ推定がスムーズ
+- `--local_fp32 entropy+decoder` で数値的に不安定な演算を FP32 に強制
+- 長めのウォームアップ (`--lr_warmup_steps`) を設定すると observer が安定
+- まずは `--qat_scope encoder` など部分的な適用から試すと破綻しにくい
+- 学習完了後は `model.update()` により EntropyBottleneck の CDF が再構築されます
+- QAT 有効時は FakeQuant/observer を除いた `best_msssim_qat.pt` と `final_updated_qat.pt` を自動保存（`torch.ao.quantization.convert` 済み、更新済みCDF含む）
 
 
 ## 4.

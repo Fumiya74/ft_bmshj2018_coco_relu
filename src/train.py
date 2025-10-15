@@ -34,6 +34,13 @@ from src.model_utils import (
     extract_likelihoods,
 )
 from src.replace_gdn_npu import replace_gdn_with_npu  # << refactored import
+try:
+    import torch.ao.quantization as _tq_backend
+except ImportError:
+    try:
+        import torch.quantization as _tq_backend  # type: ignore[assignment]
+    except ImportError:
+        _tq_backend = None
 
 def get_args():
     ap = argparse.ArgumentParser()
@@ -183,6 +190,26 @@ def _build_scheduler(args, optimizer, steps_per_epoch: int):
     elif args.sched == "plateau":
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=2, verbose=True)
     return sched
+
+def _save_qat_quantized_checkpoint(source_model: nn.Module, out_path: str, meta: dict) -> None:
+    if _tq_backend is None or not hasattr(_tq_backend, "convert"):
+        print(f"[qat] quantization backend unavailable; skip saving {out_path}")
+        return
+    try:
+        quantized = deepcopy(source_model).eval()
+        quantized.to("cpu")
+        if hasattr(quantized, "update"):
+            quantized.update()
+        quantized = _tq_backend.convert(quantized, inplace=True)
+        quantized.eval()
+    except Exception as exc:
+        print(f"[qat] Failed to convert QAT model for {out_path}: {exc}")
+        return
+    payload = dict(meta)
+    payload.pop("model", None)
+    payload["model"] = quantized.state_dict()
+    torch.save(payload, out_path)
+    print(f"[qat] Saved quantized checkpoint: {out_path}")
 
 def main():
     args = get_args()
@@ -462,6 +489,10 @@ def main():
             out_path = os.path.join(args.save_dir, "best_msssim_cdf.pt")
             torch.save(deploy_ckpt, out_path)
             print(f"[best] Saved deploy snapshot: {out_path}")
+            if use_qat:
+                qat_out = os.path.join(args.save_dir, "best_msssim_qat.pt")
+                meta = {"epoch": epoch, "best_msssim": mean_mss, "args": vars(args)}
+                _save_qat_quantized_checkpoint(snap, qat_out, meta)
 
     # ===== Post training: finalize CDF and save final_updated.pt =====
     if (args.eb_aux.lower() == "true") and hasattr(model, "update"):
@@ -471,6 +502,9 @@ def main():
         out_path = os.path.join(args.save_dir, "final_updated.pt")
         torch.save(final_ckpt, out_path)
         print(f"[post] Saved final model (after CDF update): {out_path}")
+        if use_qat:
+            qat_final_path = os.path.join(args.save_dir, "final_updated_qat.pt")
+            _save_qat_quantized_checkpoint(model, qat_final_path, {"args": vars(args)})
 
     print("Done.")
 
