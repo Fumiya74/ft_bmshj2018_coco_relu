@@ -123,8 +123,10 @@ def maybe_init_wandb(args):
             run_id = f"{base_id}_{args.act}_{args.replace_parts}_{args.train_scope}"
             run_id_file.write_text(run_id); resume_mode = None
             print(f"[wandb] Starting new run (id={run_id})")
-        wandb.init(project=os.environ.get("WANDB_PROJECT", f"bmshj2018_{args.act}"),
-                   config=vars(args), id=run_id, resume=resume_mode)
+        project_base = os.environ.get("WANDB_PROJECT", f"bmshj2018_{args.act}")
+        if args.qat.lower() == "true":
+            project_base = f"{project_base}_qat"
+        wandb.init(project=project_base, config=vars(args), id=run_id, resume=resume_mode)
         return wandb
     except Exception as e:
         print(f"W&B 無効化: {e}"); return None
