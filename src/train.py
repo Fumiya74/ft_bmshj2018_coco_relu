@@ -93,6 +93,8 @@ def get_args():
 
     ap.add_argument("--eb_aux", type=str, default="true")
     ap.add_argument("--eb_aux_lr", type=float, default=1e-3)
+    ap.add_argument("--freeze_entropy", type=str, default="false",
+                    help="If true, keeps EntropyBottleneck parameters frozen (no optimizer updates)")
 
     # QAT options (+ scope selection)
     ap.add_argument("--qat", type=str, default="false")
@@ -295,6 +297,10 @@ def main():
         )
         print(f"[QAT] enabled scope={args.qat_scope} exclude_entropy={args.qat_exclude_entropy} "
               f"calib_steps={args.qat_calib_steps} freeze_after={args.qat_freeze_after}")
+    if args.freeze_entropy.lower() == "true" and hasattr(model, "entropy_bottleneck"):
+        for p in model.entropy_bottleneck.parameters():
+            p.requires_grad = False
+        print("[train] EntropyBottleneck parameters frozen (requires_grad=False)")
     # Ensure trainable-mask reflects any module replacements that happened above
     set_trainable_parts(model, replaced_block=args.replace_parts, train_scope=args.train_scope)
 

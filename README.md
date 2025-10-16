@@ -170,6 +170,7 @@ python -m src.train \
 - **W&B と EB-aux（補助最適化）**
   - `--wandb {true,false}`：Weights & Biases
   - `--eb_aux {true,false}`, `--eb_aux_lr`：**EntropyBottleneck の補助損失**を別オプティマイザで最適化可能（学習後に `model.update()` で CDF 更新）
+  - `--freeze_entropy {true,false}`：EntropyBottleneck のパラメータを完全固定（勾配を流さず初期値を維持）
 
 > **変更点（重要）**  
 > - 旧オプション **`--amp_warmup_steps` は削除**。AMP 安定化は **bf16 + 局所FP32 + LRウォームアップ + 勾配クリップ**の組合せで対応。  
