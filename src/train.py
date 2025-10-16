@@ -292,6 +292,9 @@ def main():
     # Ensure trainable-mask reflects any module replacements that happened above
     set_trainable_parts(model, replaced_block=args.replace_parts, train_scope=args.train_scope)
 
+    print("[model] === architecture ===")
+    print(model)
+
     base_lr = args.lr
     params = [p for p in model.parameters() if p.requires_grad]
     opt = _build_optimizer(args, params)
