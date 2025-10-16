@@ -21,6 +21,7 @@ from compressai.zoo import bmshj2018_factorized
 
 from src.model_utils import replace_gdn_with_relu
 from src.replace_gdn_npu import replace_gdn_with_npu
+from src.qat_utils import prepare_qat_inplace_scoped
 
 
 def _load_checkpoint(path: Path) -> Dict[str, Any]:
@@ -63,6 +64,43 @@ def _build_model(train_args: Dict[str, Any]) -> nn.Module:
         raise ValueError(f"Unsupported act '{act}' in checkpoint args.")
 
     return model
+
+
+def _maybe_prepare_qat(model: nn.Module, train_args: Dict[str, Any]) -> None:
+    if str(train_args.get("qat", "false")).lower() != "true":
+        return
+    scope = train_args.get("qat_scope", "all")
+    exclude_entropy = str(train_args.get("qat_exclude_entropy", "true")).lower() == "true"
+    calib_steps = int(train_args.get("qat_calib_steps", 2000))
+    freeze_after = int(train_args.get("qat_freeze_after", 0))
+    module_limit = int(train_args.get("qat_module_limit", 0) or 0)
+    range_margin = float(train_args.get("qat_range_margin", 0.0) or 0.0)
+    prepare_qat_inplace_scoped(
+        model,
+        scope=scope,
+        calib_steps=calib_steps,
+        freeze_after=freeze_after,
+        exclude_entropy=exclude_entropy,
+        module_limit=module_limit,
+        range_margin=range_margin,
+        verbose=False,
+    )
+
+
+def _sanitize_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    clean: Dict[str, Any] = {}
+    for key, val in state_dict.items():
+        if key.startswith("_qat_"):
+            continue
+        if key.endswith(".scale") or key.endswith(".zero_point"):
+            if "fake_quant" in key or "activation_post_process" in key:
+                clean[key] = val
+                continue
+            continue
+        if isinstance(val, torch.Tensor) and val.is_quantized:
+            val = val.dequantize()
+        clean[key] = val
+    return clean
 
 
 class _FullWrapper(nn.Module):
@@ -134,7 +172,19 @@ def main():
     train_args = ckpt.get("args", {})
 
     model = _build_model(train_args)
-    model.load_state_dict(ckpt["model"], strict=True)
+    _maybe_prepare_qat(model, train_args)
+
+    if str(train_args.get("freeze_entropy", "false")).lower() == "true" and hasattr(model, "entropy_bottleneck"):
+        for p in model.entropy_bottleneck.parameters():
+            p.requires_grad = False
+
+    sanitized_state = _sanitize_state_dict(ckpt["model"])
+    missing, unexpected = model.load_state_dict(sanitized_state, strict=False)
+    if missing:
+        print(f"[warn] Missing keys when loading checkpoint: {missing}")
+    if unexpected:
+        print(f"[warn] Unexpected keys ignored from checkpoint: {unexpected}")
+    model.eval().cpu()
     model.eval().cpu()
 
     out_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else ckpt_path.parent
