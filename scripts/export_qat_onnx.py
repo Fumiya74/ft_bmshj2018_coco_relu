@@ -109,10 +109,9 @@ class _FullWrapper(nn.Module):
         self.model = model
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.model(x)
-        if isinstance(out, dict):
-            return out["x_hat"]
-        return out
+        latent = self.model.g_a(x)
+        recon = self.model.g_s(latent)
+        return recon
 
 
 class _EncoderWrapper(nn.Module):
@@ -184,7 +183,11 @@ def main():
         print(f"[warn] Missing keys when loading checkpoint: {missing}")
     if unexpected:
         print(f"[warn] Unexpected keys ignored from checkpoint: {unexpected}")
-    model.eval().cpu()
+    if hasattr(model, "update"):
+        try:
+            model.update()
+        except Exception as exc:
+            print(f"[warn] model.update() failed: {exc}")
     model.eval().cpu()
 
     out_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else ckpt_path.parent
