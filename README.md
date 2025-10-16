@@ -221,6 +221,8 @@ python -m src.train \
 | `--qat_calib_steps` | int (`2000`) | Calibration フェーズの長さ（observer のみ動作） |
 | `--qat_freeze_after` | int (`8000`) | このステップ以降 observer を停止（FakeQuant は継続） |
 | `--qat_init` | str (`""`) | 初期重みのパス（未指定時は `save_dir/final_updated.pt` を自動読み込み） |
+| `--qat_module_limit` | int (`0`) | QAT 対象とする Conv/Linear 層数の上限（0 はすべての該当層） |
+| `--qat_range_margin` | float (`0.0`) | Freeze 移行時に観測レンジへ加える余白（例: 0.05 で ±5% 拡張） |
 
 > ℹ️ `prepare_qat` で FakeQuant が埋め込まれるため、QAT 開始前に `final_updated.pt` を読み込むと安定します。
 

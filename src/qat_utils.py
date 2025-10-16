@@ -93,9 +93,21 @@ def _assign_qconfig_recursive(module: nn.Module, qconfig: tq.QConfig, exclude_en
         if _is_hyper_or_entropy(child, name):
             child.qconfig = None  # type: ignore[attr-defined]
 
+def _limit_qconfig_modules(module: nn.Module, module_limit: int) -> None:
+    if module_limit <= 0:
+        return
+    count = 0
+    for _, child in module.named_modules():
+        if isinstance(child, (nn.Conv2d, nn.Linear)):
+            if getattr(child, "qconfig", None) is not None:
+                count += 1
+                if count > module_limit:
+                    child.qconfig = None  # type: ignore[attr-defined]
 
-def _prepare_module_for_qat(module: nn.Module, qconfig: tq.QConfig, exclude_entropy: bool) -> None:
+
+def _prepare_module_for_qat(module: nn.Module, qconfig: tq.QConfig, exclude_entropy: bool, module_limit: int) -> None:
     _assign_qconfig_recursive(module, qconfig, exclude_entropy)
+    _limit_qconfig_modules(module, module_limit)
     tq.prepare_qat(module, inplace=True)
 
 
@@ -106,6 +118,8 @@ def prepare_qat_inplace_scoped(
     calib_steps: int = 2000,
     freeze_after: int = 0,
     exclude_entropy: bool = True,
+    module_limit: int = 0,
+    range_margin: float = 0.0,
     verbose: bool = False,
     **_: object,
 ) -> nn.Module:
@@ -118,6 +132,8 @@ def prepare_qat_inplace_scoped(
         calib_steps: Steps before enabling fake-quant (observers stay enabled).
         freeze_after: After this step observers are disabled (and BN optionally frozen).
         exclude_entropy: Always skip EntropyBottleneck / hyper modules.
+        module_limit: Limit the number of Conv/Linear layers prepared per scope (0 = no limit).
+        range_margin: Expand observer ranges by this fraction once freeze mode activates.
         verbose: Print summary.
         **_: Compatibility kwargs ignored (encoder_attr, decoder_attr, etc.)
     """
@@ -130,7 +146,7 @@ def prepare_qat_inplace_scoped(
         raise RuntimeError(f"Scope '{scope}' did not yield any modules to quantize.")
 
     for target in targets:
-        _prepare_module_for_qat(target, qconfig, exclude_entropy)
+        _prepare_module_for_qat(target, qconfig, exclude_entropy, module_limit)
 
     setattr(model, _TARGETS_ATTR, targets)
     setattr(model, _QAT_TAG, True)
@@ -150,6 +166,15 @@ def prepare_qat_inplace_scoped(
     else:
         model._qat_freeze_after.fill_(int(freeze_after))  # type: ignore[attr-defined]
 
+    if not hasattr(model, "_qat_range_margin"):
+        model.register_buffer("_qat_range_margin", torch.tensor(float(range_margin)))
+    else:
+        model._qat_range_margin.fill_(float(range_margin))  # type: ignore[attr-defined]
+    if not hasattr(model, "_qat_margin_applied"):
+        model.register_buffer("_qat_margin_applied", torch.tensor(False))
+    else:
+        model._qat_margin_applied.fill_(False)  # type: ignore[attr-defined]
+
     set_qat_mode(model, "calib")
 
     if verbose:
@@ -168,12 +193,36 @@ def _apply_to_fake_quant_modules(model: nn.Module, methods: Iterable[str]) -> No
             if callable(fn):
                 fn()
 
+@torch.no_grad()
+def _apply_range_margin(model: nn.Module, margin: float) -> None:
+    """
+    Expand observer min/max by a fractional margin to soften hard clamps after calibration.
+    """
+    margin = float(max(0.0, margin))
+    if margin == 0.0:
+        return
+    for module in model.modules():
+        obs = getattr(module, "observer", None)
+        if obs is None:
+            continue
+        min_attr = getattr(obs, "min_val", None)
+        max_attr = getattr(obs, "max_val", None)
+        if min_attr is not None and max_attr is not None:
+            span = (max_attr - min_attr).abs()
+            delta = span * margin + 1e-6
+            obs.min_val.copy_(min_attr - delta)
+            obs.max_val.copy_(max_attr + delta)
+            continue
+        max_abs = getattr(obs, "max_abs", None)
+        if max_abs is not None:
+            delta = max_abs.abs() * margin + 1e-6
+            obs.max_abs.copy_(max_abs + delta)
 
 def set_qat_mode(model: nn.Module, mode: str = "calib") -> None:
     """
     mode: "calib" (observers on, fake-quant off),
           "train" (observers + fake-quant on),
-          "freeze" (observers off, fake-quant on)
+          "freeze" (observers off, fake-quant on, optional range margin applied)
     """
     if not is_qatified(model):
         return
@@ -185,6 +234,15 @@ def set_qat_mode(model: nn.Module, mode: str = "calib") -> None:
     elif mode == "freeze":
         _apply_to_fake_quant_modules(model, ("enable_fake_quant", "disable_observer"))
         freeze_bn_stats(model)
+        margin = float(getattr(model, "_qat_range_margin", torch.tensor(0.0)).item())
+        applied_buf = getattr(model, "_qat_margin_applied", None)
+        already_applied = bool(applied_buf.item()) if isinstance(applied_buf, torch.Tensor) else False
+        if margin > 0.0 and not already_applied:
+            _apply_range_margin(model, margin)
+            if isinstance(applied_buf, torch.Tensor):
+                applied_buf.fill_(True)
+            else:
+                model.register_buffer("_qat_margin_applied", torch.tensor(True))
     else:
         raise ValueError("mode must be one of 'calib','train','freeze'")
 

@@ -103,6 +103,10 @@ def get_args():
     ap.add_argument("--qat_freeze_after", type=int, default=8000)
     ap.add_argument("--qat_init", type=str, default="",
                     help="Path to pretrained weights for QAT (defaults to {save_dir}/final_updated.pt)")
+    ap.add_argument("--qat_module_limit", type=int, default=0,
+                    help="Limit the number of Conv/Linear modules prepared for QAT within the chosen scope (0=all)")
+    ap.add_argument("--qat_range_margin", type=float, default=0.0,
+                    help="Fractional margin to expand observer min/max when transitioning to freeze (e.g., 0.05)")
 
     ap.add_argument("--resume", type=str, default="")
     ap.add_argument("--wandb", type=str, default="true")
@@ -285,6 +289,8 @@ def main():
             exclude_entropy=(args.qat_exclude_entropy.lower() == "true"),
             calib_steps=args.qat_calib_steps,
             freeze_after=args.qat_freeze_after,
+            module_limit=max(0, int(args.qat_module_limit)),
+            range_margin=max(0.0, float(args.qat_range_margin)),
             verbose=True,
         )
         print(f"[QAT] enabled scope={args.qat_scope} exclude_entropy={args.qat_exclude_entropy} "
