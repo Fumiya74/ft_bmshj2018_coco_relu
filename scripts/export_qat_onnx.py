@@ -209,7 +209,7 @@ def main():
     dec_path = out_dir / f"factorized_relu_dec_ae_{w}x{h}_qat.onnx"
     export_onnx(_DecoderWrapper(model), latent, dec_path, "y", "x_hat")
 
-    eb_npz = out_dir / "relu_entropy_params.npz"
+    eb_npz = out_dir / "relu_entropy_params_qat.npz"
     _save_entropy_params(model, eb_npz)
 
     print(f"[export] Saved full model to {full_path}")
