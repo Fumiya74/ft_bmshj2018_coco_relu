@@ -149,7 +149,7 @@ python -m src.train \
   - `--act {relu, gdnish}`：置換方式の選択
   - `--quality`：CompressAI の画質インデックス（0〜8）
   - `--replace_parts`：置換ブロック（`encoder` / `decoder` / `all`）
-  - `--train_scope`：再学習範囲（`replaced` / `replaced+hyper` / `all`）
+  - `--train_scope`：再学習範囲（`replaced` / `replaced+entropy` / `replaced+hyper` / `all`）
 - **GDNishLite 特有の引数（`--act gdnish` のみ有効）**
   - Encoder: `--enc_t`（1×1拡張率, 2.0 推奨）、`--enc_kdw`、`--enc_eca {true,false}`、`--enc_residual {true,false}`
   - Decoder: `--dec_k`、`--dec_gmin`、`--dec_gmax`、`--dec_residual {true,false}`
