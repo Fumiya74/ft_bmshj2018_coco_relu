@@ -51,8 +51,8 @@ def set_trainable_parts(model: nn.Module, replaced_block: str = "encoder", train
     train_scope = train_scope.lower()
     if replaced_block not in {"encoder","decoder","all"}:
         raise ValueError("set_trainable_parts: replaced_block must be 'encoder','decoder','all'")
-    if train_scope not in {"replaced","replaced+hyper","all"}:
-        raise ValueError("set_trainable_parts: train_scope must be 'replaced','replaced+hyper','all'")
+    if train_scope not in {"replaced","replaced+entropy","replaced+hyper","all"}:
+        raise ValueError("set_trainable_parts: train_scope must be 'replaced','replaced+entropy','replaced+hyper','all'")
 
     for p in model.parameters():
         p.requires_grad = False
@@ -73,7 +73,9 @@ def set_trainable_parts(model: nn.Module, replaced_block: str = "encoder", train
     if replaced_block in {"decoder","all"} and hasattr(model, "g_s"):
         _enable(model.g_s)
 
-    if train_scope == "replaced+hyper":
+    if train_scope == "replaced+entropy":
+        _enable(getattr(model, "entropy_bottleneck", None))
+    elif train_scope == "replaced+hyper":
         _enable(getattr(model, "h_a", None))
         _enable(getattr(model, "h_s", None))
         _enable(getattr(model, "entropy_bottleneck", None))

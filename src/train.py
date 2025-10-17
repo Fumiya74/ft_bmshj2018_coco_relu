@@ -61,7 +61,8 @@ def get_args():
 
     ap.add_argument("--act", type=str, choices=["relu","gdnish"], default="relu", help="GDN replacement: relu or gdnish")
     ap.add_argument("--replace_parts", type=str, default="encoder", choices=["encoder","decoder","all"])
-    ap.add_argument("--train_scope", type=str, default="replaced+hyper", choices=["replaced","replaced+hyper","all"])
+    ap.add_argument("--train_scope", type=str, default="replaced+hyper",
+                    choices=["replaced","replaced+entropy","replaced+hyper","all"])
 
     # NPU-friendly GDNishLite knobs (mapped to src.replace_gdn_npu)
     ap.add_argument("--enc_t", type=float, default=2.0)
