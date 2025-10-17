@@ -47,6 +47,8 @@ def get_args():
     ap.add_argument("--coco_dir", type=str, required=True, help="COCO 224 データ or COCO ルート")
     ap.add_argument("--use_prepared", type=str, default="true")
     ap.add_argument("--input_size", type=int, default=224)
+    ap.add_argument("--input_width", type=int, default=0)
+    ap.add_argument("--input_height", type=int, default=0)
     ap.add_argument("--quality", type=int, default=8, help="bmshj2018 factorized quality [0..8]")
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch_size", type=int, default=16)
@@ -232,8 +234,12 @@ def main():
     Path(args.recon_dir).mkdir(parents=True, exist_ok=True)
     wb = maybe_init_wandb(args)
 
-    tr = ImageFolder224(args.coco_dir, "train", use_prepared=use_prepared, input_size=args.input_size)
-    va = ImageFolder224(args.coco_dir, "val",   use_prepared=use_prepared, input_size=args.input_size)
+    input_w = args.input_width if args.input_width > 0 else args.input_size
+    input_h = args.input_height if args.input_height > 0 else args.input_size
+    tr = ImageFolder224(args.coco_dir, "train", use_prepared=use_prepared,
+                        input_size=args.input_size, input_width=input_w, input_height=input_h)
+    va = ImageFolder224(args.coco_dir, "val",   use_prepared=use_prepared,
+                        input_size=args.input_size, input_width=input_w, input_height=input_h)
     train_loader = DataLoader(tr, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True, drop_last=False)
     val_loader   = DataLoader(va, batch_size=args.batch_size, shuffle=False,

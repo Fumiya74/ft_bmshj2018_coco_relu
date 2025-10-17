@@ -53,7 +53,7 @@ pip install -r requirements.txt
 
 ## 2. データ準備（224×224 クロップ）
 
-COCO2017 をダウンロード済み（`train2017/` と `val2017/` が存在）なら、次で 224×224 クロップ済みデータを生成します。
+COCO2017 をダウンロード済み（`train2017/` と `val2017/` が存在）なら、次で 224×224 クロップ済みデータを生成します（`--width` / `--height` を指定すれば任意サイズで作成可能）。
 
 ```bash
 python -m scripts.coco_prepare \
