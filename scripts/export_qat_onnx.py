@@ -16,6 +16,8 @@ from typing import Any, Dict
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.onnx import register_custom_op_symbolic
+from torch.onnx.symbolic_helper import parse_args
 
 from compressai.zoo import bmshj2018_factorized
 
@@ -103,13 +105,22 @@ def _sanitize_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
     return clean
 
 
-def _disable_qat_ops(model: nn.Module) -> None:
-    # Stop observer updates and fake-quant application before ONNX export.
-    try:
-        model.apply(torch.quantization.disable_observer)
-        model.apply(torch.quantization.disable_fake_quant)
-    except AttributeError:
-        pass
+_copy_symbolic_registered = False
+
+
+@parse_args("v", "v", "b")
+def _copy_symbolic(g, self, src, non_blocking=False):
+    return g.op("Identity", src)
+
+
+def _ensure_copy_symbolic() -> None:
+    global _copy_symbolic_registered
+    if _copy_symbolic_registered:
+        return
+    for opset in range(13, 18):
+        register_custom_op_symbolic("aten::copy", _copy_symbolic, opset)
+        register_custom_op_symbolic("aten::copy_", _copy_symbolic, opset)
+    _copy_symbolic_registered = True
 
 
 class _FullWrapper(nn.Module):
@@ -155,6 +166,7 @@ def _save_entropy_params(model: nn.Module, out_path: Path) -> None:
 
 
 def export_onnx(model: nn.Module, dummy_input: torch.Tensor, out_file: Path, input_name: str, output_name: str) -> None:
+    _ensure_copy_symbolic()
     torch.onnx.export(
         model,
         dummy_input,
@@ -198,7 +210,6 @@ def main():
         except Exception as exc:
             print(f"[warn] model.update() failed: {exc}")
     model.eval().cpu()
-    _disable_qat_ops(model)
 
     out_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else ckpt_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -219,7 +230,7 @@ def main():
     dec_path = out_dir / f"factorized_relu_dec_ae_{w}x{h}_qat.onnx"
     export_onnx(_DecoderWrapper(model), latent, dec_path, "y", "x_hat")
 
-    eb_npz = out_dir / "relu_entropy_params_qat.npz"
+    eb_npz = out_dir / "relu_entropy_params.npz"
     _save_entropy_params(model, eb_npz)
 
     print(f"[export] Saved full model to {full_path}")
