@@ -103,6 +103,15 @@ def _sanitize_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
     return clean
 
 
+def _disable_qat_ops(model: nn.Module) -> None:
+    # Stop observer updates and fake-quant application before ONNX export.
+    try:
+        model.apply(torch.quantization.disable_observer)
+        model.apply(torch.quantization.disable_fake_quant)
+    except AttributeError:
+        pass
+
+
 class _FullWrapper(nn.Module):
     def __init__(self, model: nn.Module):
         super().__init__()
@@ -189,6 +198,7 @@ def main():
         except Exception as exc:
             print(f"[warn] model.update() failed: {exc}")
     model.eval().cpu()
+    _disable_qat_ops(model)
 
     out_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else ckpt_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
