@@ -93,21 +93,40 @@ def _assign_qconfig_recursive(module: nn.Module, qconfig: tq.QConfig, exclude_en
         if _is_hyper_or_entropy(child, name):
             child.qconfig = None  # type: ignore[attr-defined]
 
-def _limit_qconfig_modules(module: nn.Module, module_limit: int) -> None:
-    if module_limit <= 0:
-        return
+def _limit_qconfig_modules(module: nn.Module, module_limit: int, skip_first_conv: bool) -> None:
+    unlimited = module_limit <= 0
+    first_skipped = False
+    remaining = None
+    if skip_first_conv:
+        remaining = None if unlimited else max(0, module_limit - 1)
     count = 0
     for _, child in module.named_modules():
         if isinstance(child, (nn.Conv2d, nn.Linear)):
-            if getattr(child, "qconfig", None) is not None:
-                count += 1
-                if count > module_limit:
+            if getattr(child, "qconfig", None) is None:
+                continue
+            if skip_first_conv and not first_skipped:
+                child.qconfig = None  # type: ignore[attr-defined]
+                first_skipped = True
+                continue
+            if skip_first_conv:
+                if remaining is None:
+                    continue
+                if remaining <= 0:
                     child.qconfig = None  # type: ignore[attr-defined]
+                else:
+                    remaining -= 1
+                continue
+            if unlimited:
+                continue
+            count += 1
+            if count > module_limit:
+                child.qconfig = None  # type: ignore[attr-defined]
 
 
-def _prepare_module_for_qat(module: nn.Module, qconfig: tq.QConfig, exclude_entropy: bool, module_limit: int) -> None:
+def _prepare_module_for_qat(module: nn.Module, qconfig: tq.QConfig,
+                            exclude_entropy: bool, module_limit: int, skip_first_conv: bool) -> None:
     _assign_qconfig_recursive(module, qconfig, exclude_entropy)
-    _limit_qconfig_modules(module, module_limit)
+    _limit_qconfig_modules(module, module_limit, skip_first_conv)
     tq.prepare_qat(module, inplace=True)
 
 
@@ -120,6 +139,7 @@ def prepare_qat_inplace_scoped(
     exclude_entropy: bool = True,
     module_limit: int = 0,
     range_margin: float = 0.0,
+    skip_first_conv: bool = False,
     verbose: bool = False,
     **_: object,
 ) -> nn.Module:
@@ -146,7 +166,7 @@ def prepare_qat_inplace_scoped(
         raise RuntimeError(f"Scope '{scope}' did not yield any modules to quantize.")
 
     for target in targets:
-        _prepare_module_for_qat(target, qconfig, exclude_entropy, module_limit)
+        _prepare_module_for_qat(target, qconfig, exclude_entropy, module_limit, skip_first_conv)
 
     setattr(model, _TARGETS_ATTR, targets)
     setattr(model, _QAT_TAG, True)

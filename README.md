@@ -224,6 +224,7 @@ python -m src.train \
 | `--qat_init` | str (`""`) | 初期重みのパス（未指定時は `save_dir/final_updated.pt` を自動読み込み） |
 | `--qat_module_limit` | int (`0`) | QAT 対象とする Conv/Linear 層数の上限（0 はすべての該当層） |
 | `--qat_range_margin` | float (`0.0`) | Freeze 移行時に観測レンジへ加える余白（例: 0.05 で ±5% 拡張） |
+| `--qat_skip_first_conv` | bool (`false`) | エンコーダ／デコーダの最初の Conv を QAT 対象から除外 |
 
 > ℹ️ `prepare_qat` で FakeQuant が埋め込まれるため、QAT 開始前に `final_updated.pt` を読み込むと安定します。
 

@@ -112,6 +112,8 @@ def get_args():
                     help="Limit the number of Conv/Linear modules prepared for QAT within the chosen scope (0=all)")
     ap.add_argument("--qat_range_margin", type=float, default=0.0,
                     help="Fractional margin to expand observer min/max when transitioning to freeze (e.g., 0.05)")
+    ap.add_argument("--qat_skip_first_conv", type=str, default="false",
+                    help="Exclude the first Conv layer in scope from QAT FakeQuant")
 
     ap.add_argument("--resume", type=str, default="")
     ap.add_argument("--wandb", type=str, default="true")
@@ -300,6 +302,7 @@ def main():
             freeze_after=args.qat_freeze_after,
             module_limit=max(0, int(args.qat_module_limit)),
             range_margin=max(0.0, float(args.qat_range_margin)),
+            skip_first_conv=(args.qat_skip_first_conv.lower() == "true"),
             verbose=True,
         )
         print(f"[QAT] enabled scope={args.qat_scope} exclude_entropy={args.qat_exclude_entropy} "
